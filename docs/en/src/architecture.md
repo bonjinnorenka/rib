@@ -135,10 +135,10 @@ registry publication boundaries receive contextual messages. If a `--copy`
 worker fails, a shared cancellation token stops the remaining wrappers; the
 coordinator waits for them and returns the original contextual error.
 
-Blocking writers check cancellation between writes. Ctrl-C cancels the
-top-level operation, although the current version has no separate SIGTERM
-handler. Temporary directories are owned by RAII values and are cleaned when
-work is cancelled or fails.
+Blocking COPY, archive, and decompression writers check cancellation between
+writes. Ctrl-C and, on Unix, SIGTERM cancel the top-level operation. Temporary
+directories are owned by RAII values and are cleaned when work is cancelled or
+fails; an archive is persisted only after its cancellation-safe write finishes.
 
 ## The `oci-client` and `oci-spec` boundary
 

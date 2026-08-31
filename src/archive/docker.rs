@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use oci_spec::image::Digest;
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::output::write_image_tar;
@@ -26,6 +27,7 @@ pub fn write_docker_archive(
     layers: &dyn LayerProvider,
     target: &Path,
     tag: Option<&str>,
+    cancellation: &CancellationToken,
 ) -> Result<()> {
     let diff_ids: Vec<Digest> = bundle
         .config
@@ -58,7 +60,7 @@ pub fn write_docker_archive(
     }])
     .context("serializing docker manifest")?;
 
-    write_image_tar(target, "Docker archive", |archive| {
+    write_image_tar(target, "Docker archive", cancellation, |archive| {
         write_entry(
             archive,
             "manifest.json",
@@ -86,9 +88,9 @@ pub fn write_docker_archive(
                 continue;
             }
             let mut file = layers
-                .uncompressed_file(layer)
+                .uncompressed_file(layer, cancellation)
                 .with_context(|| format!("fetching uncompressed layer {diff_id}"))?;
-            write_entry(archive, path, EntryData::File(&mut file), None, None)?;
+            write_entry(archive, path, EntryData::File(&mut file), Some(0o644), None)?;
         }
         Ok(())
     })?;

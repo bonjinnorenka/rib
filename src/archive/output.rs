@@ -5,12 +5,22 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use tokio_util::sync::CancellationToken;
+
+use crate::cancellable_io::CancellableWriter;
+
+type ArchiveWriter = CancellableWriter<BufWriter<File>>;
 
 pub fn write_image_tar(
     target: &Path,
     archive_name: &str,
-    write_entries: impl FnOnce(&mut tar::Builder<BufWriter<File>>) -> Result<()>,
+    cancellation: &CancellationToken,
+    write_entries: impl FnOnce(&mut tar::Builder<ArchiveWriter>) -> Result<()>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        !cancellation.is_cancelled(),
+        "{archive_name} write cancelled"
+    );
     let parent = target
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -32,7 +42,9 @@ pub fn write_image_tar(
     let file = temporary
         .reopen()
         .with_context(|| format!("opening temporary {archive_name}"))?;
-    let mut archive = tar::Builder::new(BufWriter::new(file));
+    let writer =
+        CancellableWriter::new(BufWriter::new(file), cancellation.clone(), "archive write");
+    let mut archive = tar::Builder::new(writer);
 
     write_entries(&mut archive)?;
 
@@ -43,10 +55,18 @@ pub fn write_image_tar(
         .flush()
         .with_context(|| format!("flushing {archive_name}"))?;
     drop(writer);
+    anyhow::ensure!(
+        !cancellation.is_cancelled(),
+        "{archive_name} write cancelled"
+    );
     temporary
         .as_file()
         .sync_all()
         .with_context(|| format!("syncing {archive_name}"))?;
+    anyhow::ensure!(
+        !cancellation.is_cancelled(),
+        "{archive_name} write cancelled"
+    );
     let _published = temporary
         .persist(target)
         .map_err(|error| error.error)

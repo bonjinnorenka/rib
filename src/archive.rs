@@ -16,6 +16,7 @@ mod tests {
     use oci_spec::image::{ANNOTATION_REF_NAME, ImageIndex};
     use serde::Deserialize;
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::blob::LayerProvider;
@@ -36,7 +37,11 @@ mod tests {
             }
         }
 
-        fn uncompressed_file(&self, source: &LayerSource) -> Result<File> {
+        fn uncompressed_file(
+            &self,
+            source: &LayerSource,
+            _cancellation: &CancellationToken,
+        ) -> Result<File> {
             match source {
                 LayerSource::Built(layer) => layer.open_uncompressed(),
                 LayerSource::FromBase { .. } => bail!("fixture has no base layers"),
@@ -101,7 +106,14 @@ mod tests {
         let bundle = bundle(b"oci");
         let directory = TempDir::new().unwrap();
         let archive = directory.path().join("image.tar");
-        write_oci_archive(&bundle, &BuiltOnly, &archive, Some("app:v1")).unwrap();
+        write_oci_archive(
+            &bundle,
+            &BuiltOnly,
+            &archive,
+            Some("app:v1"),
+            &CancellationToken::new(),
+        )
+        .unwrap();
 
         let paths = paths(&archive);
         assert!(paths.contains("oci-layout"));
@@ -140,7 +152,14 @@ mod tests {
         let bundle = bundle(b"docker");
         let directory = TempDir::new().unwrap();
         let archive = directory.path().join("image.tar");
-        write_docker_archive(&bundle, &BuiltOnly, &archive, Some("app:v1")).unwrap();
+        write_docker_archive(
+            &bundle,
+            &BuiltOnly,
+            &archive,
+            Some("app:v1"),
+            &CancellationToken::new(),
+        )
+        .unwrap();
 
         let manifest: Vec<DockerManifest> =
             serde_json::from_slice(&read_entry(&archive, "manifest.json")).unwrap();
@@ -174,8 +193,22 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let first_oci = directory.path().join("first-oci.tar");
         let second_oci = directory.path().join("second-oci.tar");
-        write_oci_archive(&first, &BuiltOnly, &first_oci, Some("app:v1")).unwrap();
-        write_oci_archive(&second, &BuiltOnly, &second_oci, Some("app:v1")).unwrap();
+        write_oci_archive(
+            &first,
+            &BuiltOnly,
+            &first_oci,
+            Some("app:v1"),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        write_oci_archive(
+            &second,
+            &BuiltOnly,
+            &second_oci,
+            Some("app:v1"),
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(first_oci).unwrap(),
             std::fs::read(second_oci).unwrap()
@@ -183,8 +216,22 @@ mod tests {
 
         let first_docker = directory.path().join("first-docker.tar");
         let second_docker = directory.path().join("second-docker.tar");
-        write_docker_archive(&first, &BuiltOnly, &first_docker, Some("app:v1")).unwrap();
-        write_docker_archive(&second, &BuiltOnly, &second_docker, Some("app:v1")).unwrap();
+        write_docker_archive(
+            &first,
+            &BuiltOnly,
+            &first_docker,
+            Some("app:v1"),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        write_docker_archive(
+            &second,
+            &BuiltOnly,
+            &second_docker,
+            Some("app:v1"),
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(first_docker).unwrap(),
             std::fs::read(second_docker).unwrap()
@@ -198,7 +245,11 @@ mod tests {
             bail!("intentional failure")
         }
 
-        fn uncompressed_file(&self, _: &LayerSource) -> Result<File> {
+        fn uncompressed_file(
+            &self,
+            _: &LayerSource,
+            _cancellation: &CancellationToken,
+        ) -> Result<File> {
             bail!("intentional failure")
         }
     }
@@ -208,7 +259,95 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let target = directory.path().join("image.tar");
         std::fs::write(&target, b"previous-good-output").unwrap();
-        assert!(write_oci_archive(&bundle(b"x"), &AlwaysFails, &target, None).is_err());
+        assert!(
+            write_oci_archive(
+                &bundle(b"x"),
+                &AlwaysFails,
+                &target,
+                None,
+                &CancellationToken::new(),
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read(target).unwrap(), b"previous-good-output");
+    }
+
+    struct CancelsBeforeLayer {
+        cancellation: CancellationToken,
+    }
+
+    impl LayerProvider for CancelsBeforeLayer {
+        fn blob_file(&self, source: &LayerSource) -> Result<File> {
+            self.cancellation.cancel();
+            match source {
+                LayerSource::Built(layer) => layer.open_compressed(),
+                LayerSource::FromBase { .. } => bail!("fixture has no base layers"),
+            }
+        }
+
+        fn uncompressed_file(
+            &self,
+            source: &LayerSource,
+            _cancellation: &CancellationToken,
+        ) -> Result<File> {
+            match source {
+                LayerSource::Built(layer) => layer.open_uncompressed(),
+                LayerSource::FromBase { .. } => bail!("fixture has no base layers"),
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_archive_preserves_existing_target() {
+        let directory = TempDir::new().unwrap();
+        let target = directory.path().join("image.tar");
+        std::fs::write(&target, b"previous-good-output").unwrap();
+        let cancellation = CancellationToken::new();
+        let provider = CancelsBeforeLayer {
+            cancellation: cancellation.clone(),
+        };
+
+        let error =
+            write_oci_archive(&bundle(b"x"), &provider, &target, None, &cancellation).unwrap_err();
+
+        assert!(format!("{error:#}").contains("archive write cancelled"));
+        assert_eq!(std::fs::read(target).unwrap(), b"previous-good-output");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oci_blob_entries_have_fixed_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bundle = bundle(b"mode-independent");
+        let layer = match &bundle.layers[0] {
+            LayerSource::Built(layer) => layer,
+            LayerSource::FromBase { .. } => panic!("fixture layer must be built"),
+        };
+        std::fs::set_permissions(
+            &layer.storage.compressed_path,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let layer_path = blob_path(layer.descriptor.digest());
+        let directory = TempDir::new().unwrap();
+        let target = directory.path().join("image.tar");
+        write_oci_archive(
+            &bundle,
+            &BuiltOnly,
+            &target,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        let mut archive = ::tar::Archive::new(File::open(target).unwrap());
+        let entry = archive
+            .entries()
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.path().unwrap().to_string_lossy() == layer_path)
+            .expect("OCI archive must contain its layer blob");
+        assert_eq!(entry.header().mode().unwrap() & 0o777, 0o644);
     }
 }

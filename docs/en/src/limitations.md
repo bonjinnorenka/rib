@@ -37,8 +37,6 @@
   the `auths` section are supported.
 - Signing, SBOM, and provenance are external; stdout exposes the manifest
   digest for tools such as `cosign`.
-- Ctrl-C uses cooperative cancellation; there is no separate SIGTERM handler.
-
 ## Possible future work
 
 - caching built layers with safe concurrent access;

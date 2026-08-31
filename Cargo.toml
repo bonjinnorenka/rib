@@ -56,3 +56,19 @@ shlex = "2.0.1"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[package.metadata.rib]
+artifact = "target/x86_64-unknown-linux-musl/release/rib"
+platform = "linux/amd64"
+from = "alpine:3.23.5"
+to = ["registry:ghcr.io/kuzmenkodm/rib:latest", "registry:ghcr.io/kuzmenkodm/rib:0.1.0-alpine"]
+entrypoint = "/bin/sh"
+destination = "/usr/bin/rib"
+creation-time = "epoch"
+cache = true
+jobs = 4
+cargo-args = [
+  "--release",
+  "--locked",
+  "--target", "x86_64-unknown-linux-musl",
+]

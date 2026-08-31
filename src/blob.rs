@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, copy};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use oci_spec::image::{Digest, MediaType};
+use tokio_util::sync::CancellationToken;
 
 use crate::cache::CacheController;
+use crate::cancellable_io::CancellableWriter;
 use crate::digest::short_digest;
 use crate::image::Image;
 use crate::image::layer::LayerSource;
@@ -15,18 +17,45 @@ use crate::registry::RegistryClient;
 
 pub trait LayerProvider: Send + Sync {
     fn blob_file(&self, source: &LayerSource) -> Result<File>;
-    fn uncompressed_file(&self, source: &LayerSource) -> Result<File>;
+    fn uncompressed_file(
+        &self,
+        source: &LayerSource,
+        cancellation: &CancellationToken,
+    ) -> Result<File>;
 }
 
+/// Process-local base-layer store. Archive outputs populate it eagerly; a
+/// registry fallback upload populates it lazily so later targets reuse the
+/// same local file without another pull.
+#[derive(Default)]
 pub struct DownloadedLayers {
-    files: HashMap<Digest, File>,
+    files: Mutex<HashMap<Digest, File>>,
 }
 
 impl DownloadedLayers {
     pub fn empty() -> Self {
-        Self {
-            files: HashMap::new(),
-        }
+        Self::default()
+    }
+
+    pub(crate) fn blob_file_by_digest(&self, digest: &Digest) -> Result<Option<File>> {
+        self.files
+            .lock()
+            .map_err(|_| anyhow!("downloaded layer store lock error"))?
+            .get(digest)
+            .map(|file| file.try_clone())
+            .transpose()
+            .with_context(|| format!("cloning downloaded layer {digest}"))
+    }
+
+    pub(crate) fn fix_blob(&self, digest: Digest, file: &File) -> Result<()> {
+        let file = file
+            .try_clone()
+            .with_context(|| format!("cloning downloaded layer {digest}"))?;
+        self.files
+            .lock()
+            .map_err(|_| anyhow!("downloaded layer store lock error"))?
+            .insert(digest, file);
+        Ok(())
     }
 
     pub async fn fetch(
@@ -98,7 +127,9 @@ impl DownloadedLayers {
             let (digest, file) = result.context("blob download task panicked")??;
             layer_files.insert(digest, file);
         }
-        Ok(Self { files: layer_files })
+        Ok(Self {
+            files: Mutex::new(layer_files),
+        })
     }
 }
 
@@ -106,65 +137,73 @@ impl LayerProvider for DownloadedLayers {
     fn blob_file(&self, source: &LayerSource) -> Result<File> {
         match source {
             LayerSource::Built(layer) => layer.open_compressed(),
-            LayerSource::FromBase { descriptor, .. } => Ok(self
-                .files
-                .get(descriptor.digest())
-                .with_context(|| format!("layer {} was not downloaded", descriptor.digest()))?
-                .try_clone()?),
+            LayerSource::FromBase { descriptor, .. } => self
+                .blob_file_by_digest(descriptor.digest())?
+                .with_context(|| format!("layer {} was not downloaded", descriptor.digest())),
         }
     }
 
-    fn uncompressed_file(&self, source: &LayerSource) -> Result<File> {
+    fn uncompressed_file(
+        &self,
+        source: &LayerSource,
+        cancellation: &CancellationToken,
+    ) -> Result<File> {
         match source {
             LayerSource::Built(layer) => layer.open_uncompressed(),
             LayerSource::FromBase { .. } => {
                 let mut blob = self.blob_file(source)?;
-                decode_to_temp(&mut blob, source.descriptor().media_type())
+                decode_to_temp(&mut blob, source.descriptor().media_type(), cancellation)
             }
         }
     }
 }
 
-fn decode_to_temp(reader: &mut File, media_type: &MediaType) -> Result<File> {
+fn decode_to_temp(
+    reader: &mut File,
+    media_type: &MediaType,
+    cancellation: &CancellationToken,
+) -> Result<File> {
     match media_type {
         MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => {
             reader.seek(SeekFrom::Start(0))?;
             reader.try_clone().context("cloning uncompressed layer")
         }
         MediaType::ImageLayerGzip | MediaType::ImageLayerNonDistributableGzip => {
-            gunzip_to_temp(reader)
+            gunzip_to_temp(reader, cancellation)
         }
         MediaType::ImageLayerZstd | MediaType::ImageLayerNonDistributableZstd => {
-            zstd_to_temp(reader)
+            zstd_to_temp(reader, cancellation)
         }
         MediaType::Other(value) if value.ends_with(".tar.gzip") || value.ends_with("+gzip") => {
-            gunzip_to_temp(reader)
+            gunzip_to_temp(reader, cancellation)
         }
-        MediaType::Other(value) if value.ends_with("+zstd") => zstd_to_temp(reader),
+        MediaType::Other(value) if value.ends_with("+zstd") => zstd_to_temp(reader, cancellation),
         other => bail!("unsupported layer media type {other}"),
     }
 }
 
-fn gunzip_to_temp(reader: &mut File) -> Result<File> {
+fn gunzip_to_temp(reader: &mut File, cancellation: &CancellationToken) -> Result<File> {
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|error| anyhow!("seek compressed data: {error}"))?;
     let mut decoder = flate2::read::GzDecoder::new(reader);
-    copy_to_temp(&mut decoder).context("gunzip")
+    copy_to_temp(&mut decoder, cancellation).context("gunzip")
 }
 
-fn zstd_to_temp(reader: &mut File) -> Result<File> {
+fn zstd_to_temp(reader: &mut File, cancellation: &CancellationToken) -> Result<File> {
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|error| anyhow!("seek compressed data: {error}"))?;
     let mut decoder =
         zstd::stream::read::Decoder::new(reader).map_err(|error| anyhow!("zstd: {error}"))?;
-    copy_to_temp(&mut decoder).context("zstd")
+    copy_to_temp(&mut decoder, cancellation).context("zstd")
 }
 
-fn copy_to_temp(reader: &mut impl std::io::Read) -> Result<File> {
-    let mut temporary = tempfile::tempfile().context("creating decompression tempfile")?;
-    copy(reader, &mut temporary).context("decompressing layer")?;
+fn copy_to_temp(reader: &mut impl std::io::Read, cancellation: &CancellationToken) -> Result<File> {
+    let temporary = tempfile::tempfile().context("creating decompression tempfile")?;
+    let mut writer = CancellableWriter::new(temporary, cancellation.clone(), "layer decompression");
+    copy(reader, &mut writer).context("decompressing layer")?;
+    let mut temporary = writer.into_inner();
     temporary
         .seek(SeekFrom::Start(0))
         .context("rewinding decompressed layer")?;
@@ -176,15 +215,48 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    use crate::digest::sha256_digest;
+
     #[test]
     fn zstd_stream_is_decoded() {
         let mut compressed = tempfile::tempfile().unwrap();
         zstd::stream::copy_encode(b"uncompressed layer bytes".as_slice(), &mut compressed, 1)
             .unwrap();
         compressed.flush().unwrap();
-        let mut decoded = zstd_to_temp(&mut compressed).unwrap();
+        let mut decoded = zstd_to_temp(&mut compressed, &CancellationToken::new()).unwrap();
         let mut bytes = Vec::new();
         decoded.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"uncompressed layer bytes");
+    }
+
+    #[test]
+    fn decompression_observes_cancellation() {
+        let mut compressed = tempfile::tempfile().unwrap();
+        zstd::stream::copy_encode(b"uncompressed layer bytes".as_slice(), &mut compressed, 1)
+            .unwrap();
+        compressed.flush().unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = zstd_to_temp(&mut compressed, &cancellation).unwrap_err();
+
+        assert!(format!("{error:#}").contains("layer decompression cancelled"));
+    }
+
+    #[test]
+    fn remembered_blob_is_available_to_later_consumers() {
+        let digest = sha256_digest(b"shared base layer");
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"shared base layer").unwrap();
+        let layers = DownloadedLayers::empty();
+        assert!(layers.blob_file_by_digest(&digest).unwrap().is_none());
+
+        layers.fix_blob(digest.clone(), &file).unwrap();
+
+        let mut remembered = layers.blob_file_by_digest(&digest).unwrap().unwrap();
+        remembered.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        remembered.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"shared base layer");
     }
 }

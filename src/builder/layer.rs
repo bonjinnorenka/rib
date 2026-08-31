@@ -5,7 +5,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::builder::copy::{CopySpec, Owner, join_posix, resolve_targets, strip_leading_slash};
-use crate::builder::writers::{CancelLableWriter, HashingWriter, SplitWriter};
+use crate::builder::writers::{HashingWriter, SplitWriter};
+use crate::cancellable_io::CancellableWriter;
 use crate::image::layer::{Layer, LayerStorage};
 use crate::tar_io::{EntryData, write_entry};
 use anyhow::{Context, Result};
@@ -42,7 +43,7 @@ pub(crate) fn build_copy_layer_with_options(
     let gz = GzEncoder::new(compressed_hashing_writer, Compression::fast());
     let uncompressed_hashing_writer = HashingWriter::new(uncompressed_writer);
     let split_writer = SplitWriter::new(uncompressed_hashing_writer, gz);
-    let cancellable_writer = CancelLableWriter::new(split_writer, cancellation);
+    let cancellable_writer = CancellableWriter::new(split_writer, cancellation, "layer build");
     let mut builder = tar::Builder::new(cancellable_writer);
 
     write_to_tar(&mut builder, spec)?;

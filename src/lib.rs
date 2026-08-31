@@ -7,6 +7,7 @@ mod auth;
 mod blob;
 mod builder;
 mod cache;
+mod cancellable_io;
 mod cargo_integration;
 mod cli;
 mod digest;
@@ -36,11 +37,36 @@ where
 {
     tokio::select! {
         result = operation => result,
-        signal = tokio::signal::ctrl_c() => {
-            signal.context("installing Ctrl-C handler")?;
+        signal = interruption_signal() => {
+            signal?;
             bail!("interrupted")
         }
     }
+}
+
+async fn interruption_signal() -> Result<()> {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .context("installing Ctrl-C handler")
+    };
+
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("installing SIGTERM handler")?;
+        tokio::select! {
+            result = ctrl_c => result,
+            signal = terminate.recv() => {
+                signal.context("SIGTERM signal stream closed")?;
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await
 }
 
 fn init_tracing(progress: &Progress) {

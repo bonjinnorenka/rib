@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use oci_spec::image::{
     ANNOTATION_REF_NAME, DescriptorBuilder, ImageIndexBuilder, MediaType, SCHEMA_VERSION,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::output::write_image_tar;
@@ -20,9 +21,10 @@ pub fn write_oci_archive(
     layers: &dyn LayerProvider,
     target: &Path,
     tag: Option<&str>,
+    cancellation: &CancellationToken,
 ) -> Result<()> {
     let index_json = build_index_json(bundle, tag)?;
-    write_image_tar(target, "OCI archive", |archive| {
+    write_image_tar(target, "OCI archive", cancellation, |archive| {
         write_entry(
             archive,
             "oci-layout",
@@ -66,7 +68,7 @@ pub fn write_oci_archive(
                 archive,
                 &blob_path(descriptor.digest()),
                 EntryData::File(&mut file),
-                None,
+                Some(0o644),
                 None,
             )?;
         }

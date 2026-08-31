@@ -22,6 +22,14 @@ use crate::output_target::OutputTarget;
 use crate::progress::Progress;
 use crate::registry::{RegistryClient, RegistryOptions};
 
+type ArchiveWrite = fn(
+    &ImageBundle,
+    &dyn LayerProvider,
+    &std::path::Path,
+    Option<&str>,
+    &CancellationToken,
+) -> Result<()>;
+
 #[derive(Debug, Clone)]
 pub(crate) struct CopyDirective {
     description: String,
@@ -281,9 +289,9 @@ impl BuildRequest {
                 }
                 None => DownloadedLayers::empty(),
             };
-            Some(Arc::new(layers))
+            Arc::new(layers)
         } else {
-            None
+            Arc::new(DownloadedLayers::empty())
         };
 
         let task = progress.spinner("assemble manifest + config");
@@ -370,24 +378,31 @@ impl BuildRequest {
 
 async fn write_archive_target(
     kind: &str,
-    write: fn(&ImageBundle, &dyn LayerProvider, &std::path::Path, Option<&str>) -> Result<()>,
+    write: ArchiveWrite,
     bundle: &ImageBundle,
-    downloaded_layers: &Option<Arc<DownloadedLayers>>,
+    downloaded_layers: &Arc<DownloadedLayers>,
     path: std::path::PathBuf,
     tag: Option<String>,
     progress: &Progress,
 ) -> Result<()> {
     let task = progress.spinner(format!("write {kind} → {}", path.display()));
     let bundle = bundle.clone();
-    let layers = downloaded_layers
-        .clone()
-        .expect("archive layers are fetched when an archive target exists");
+    let layers = downloaded_layers.clone();
     let archive_path = path.clone();
+    let cancellation = CancellationToken::new();
+    let cancel_on_drop = cancellation.clone().drop_guard();
     tokio::task::spawn_blocking(move || {
-        write(&bundle, layers.as_ref(), &archive_path, tag.as_deref())
+        write(
+            &bundle,
+            layers.as_ref(),
+            &archive_path,
+            tag.as_deref(),
+            &cancellation,
+        )
     })
     .await
     .with_context(|| format!("{kind} worker panicked"))??;
+    cancel_on_drop.disarm();
     task.done_with(HumanBytes(std::fs::metadata(path)?.len()).to_string());
     Ok(())
 }

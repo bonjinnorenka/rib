@@ -112,8 +112,9 @@ Rust project that may interpret it. Use `plain`, `quiet`, or `auto` in CI;
 
 ## Termination and partially published data
 
-Ctrl-C cancels the top-level operation. Copy writers check cancellation during
-writes; there is no dedicated SIGTERM handler in the current version.
+Ctrl-C and, on Unix, SIGTERM cancel the top-level operation. Copy, archive, and
+layer-decompression writers check cancellation during writes. A cancelled
+archive remains temporary and is not published at its target path.
 
 Archives become visible through an atomic rename only after a complete write
 and file synchronization. Registry manifests are sent after layers and the
