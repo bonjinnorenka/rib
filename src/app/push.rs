@@ -151,10 +151,9 @@ async fn push_one_layer(
         {
             Ok(()) => {
                 progress.note(format!(
-                    "layer {} mounted from {}/{}",
+                    "layer {} mounted from {}",
                     short_digest(&digest),
-                    source.reference.resolve_registry(),
-                    source.reference.repository()
+                    source.reference
                 ));
                 return Ok(LayerPush::Mounted);
             }
