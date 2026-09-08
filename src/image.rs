@@ -100,13 +100,7 @@ pub struct ImageSource {
 
 impl ImageSource {
     pub fn repository_reference(&self) -> Reference {
-        format!(
-            "{}/{}",
-            self.reference.resolve_registry(),
-            self.reference.repository()
-        )
-        .parse()
-        .expect("parts of a parsed reference form a valid repository reference")
+        self.reference.clone()
     }
 }
 

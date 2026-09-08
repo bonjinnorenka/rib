@@ -1,6 +1,8 @@
 // Adapter around oci-client. OCI descriptors are converted to oci-spec at the
 // boundary; layer blobs remain lazy so pushes can cross-mount them
 
+mod token;
+
 use std::fs::File;
 use std::future::Future;
 use std::io::{Seek, SeekFrom};
@@ -67,9 +69,27 @@ impl Default for RegistryOptions {
     }
 }
 
+impl RegistryOptions {
+    fn client_config(&self) -> ClientConfig {
+        ClientConfig {
+            protocol: if self.plain_http_hosts.is_empty() {
+                ClientProtocol::Https
+            } else {
+                ClientProtocol::HttpsExcept(self.plain_http_hosts.clone())
+            },
+            accept_invalid_certificates: self.skip_tls_verify,
+            connect_timeout: Some(self.connect_timeout),
+            read_timeout: Some(self.read_timeout),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RegistryClient {
     inner: Client,
+    tokens: token::TokenClient,
+    options: RegistryOptions,
     credentials: Arc<Credentials>,
     platform: Platform,
     retry_policy: RetryPolicy,
@@ -86,12 +106,8 @@ impl RegistryClient {
         platform: Platform,
         options: RegistryOptions,
     ) -> Result<Self> {
-        let protocol = if options.plain_http_hosts.is_empty() {
-            ClientProtocol::Https
-        } else {
-            ClientProtocol::HttpsExcept(options.plain_http_hosts)
-        };
-
+        let tokens =
+            token::TokenClient::new(&options).context("creating registry token HTTP client")?;
         let resolver_platform = platform.clone();
         let cfg = ClientConfig {
             // The default resolver selects the host platform, which is wrong
@@ -110,15 +126,12 @@ impl RegistryClient {
                     })
                     .map(|e| e.digest.clone())
             })),
-            protocol,
-            accept_invalid_certificates: options.skip_tls_verify,
-            connect_timeout: Some(options.connect_timeout),
-            read_timeout: Some(options.read_timeout),
-            ..Default::default()
+            ..options.client_config()
         };
         let inner = Client::try_from(cfg).context("creating OCI registry HTTP client")?;
         Ok(Self {
             inner,
+            tokens,
             credentials: Arc::new(credentials),
             platform,
             retry_policy: RetryPolicy {
@@ -126,6 +139,7 @@ impl RegistryClient {
                 initial_delay: Duration::from_millis(250),
                 max_delay: Duration::from_secs(2),
             },
+            options,
         })
     }
 
@@ -307,9 +321,22 @@ impl RegistryClient {
         source: &Reference,
         digest: &Digest,
     ) -> Result<()> {
-        self.ensure_auth(target).await;
-        retry_registry("mount blob", self.retry_policy, || {
-            self.inner.mount_blob(target, source, digest.as_ref())
+        let auth = self.registry_auth_for(target.resolve_registry());
+        retry_registry("mount blob", self.retry_policy, || async {
+            let registry = target.resolve_registry();
+            if registry != source.resolve_registry() {
+                return Err(OciDistributionError::SpecViolationError(
+                    "blob mounts require source and target in the same registry".into(),
+                ));
+            }
+            let mount_auth = self.tokens.auth_for_mount(target, source, &auth).await?;
+
+            // Client::clone shares the auth store and token cache. A fresh
+            // instance keeps each mount's token independent of other sources
+            // and ordinary pull/push authentication.
+            let client = Client::try_from(self.options.client_config())?;
+            client.store_auth_if_needed(registry, &mount_auth).await;
+            client.mount_blob(target, source, digest.as_ref()).await
         })
         .await
         .with_context(|| format!("mounting blob {digest} from {} to {}", source, target))

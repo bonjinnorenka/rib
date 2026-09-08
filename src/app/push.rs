@@ -159,8 +159,9 @@ async fn push_one_layer(
                 return Ok(LayerPush::Mounted);
             }
             Err(error) => progress.note(format!(
-                "layer {} mount failed ({error}), fallback upload",
-                short_digest(&digest)
+                "layer {} mount failed ({}), fallback upload",
+                short_digest(&digest),
+                error
             )),
         }
     }
@@ -235,9 +236,7 @@ async fn base_layer_file(
             file
         }
     };
-    local_layers
-        .downloaded
-        .fix_blob(digest.clone(), &file)?;
+    local_layers.downloaded.fix_blob(digest.clone(), &file)?;
     Ok(file)
 }
 

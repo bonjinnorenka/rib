@@ -29,11 +29,11 @@ clap = { version = "4.6.6", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 base64 = "0.23.1"
-dirs = "6.0.0"
+dirs = "7.0.0"
 anyhow = "1.0.102"
 tar = "0.4.45"
-flate2 = "1.1.9"
-zstd = "0.13.3"
+flate2 = "1.1.10"
+zstd = "0.14.0"
 futures-util = "0.3.34"
 sha2 = { version = "0.10.0", features = ["std"] }
 hex = "0.4.3"
@@ -41,6 +41,8 @@ walkdir = "2.5.0"
 glob = "0.3.3"
 bytes = "1.12.1"
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "query"] }
+http-auth = { version = "0.1.10", default-features = false }
 oci-spec = "0.10.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
 tokio = { version = "1.53.1", features = ["full"] }
