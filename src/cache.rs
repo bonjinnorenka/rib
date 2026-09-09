@@ -1,132 +1,197 @@
-use anyhow::{Context, Result};
-use std::{collections::HashSet, path::PathBuf};
+use std::fs::File;
+use std::io::{ErrorKind, Read};
+use std::path::{Path, PathBuf};
 
-use crate::{digest::sha256_digest_file, progress::Progress};
+use anyhow::{Context, Result, ensure};
+use oci_spec::image::{Digest, DigestAlgorithm};
+use sha2::{Sha256, Sha512};
+use tempfile::NamedTempFile;
+use tokio_util::sync::CancellationToken;
+
+use crate::blob::BlobFile;
 
 pub const DEFAULT_CACHE_DIR: &str = ".rib-cache";
 
-/// Digests contain a colon (`sha256:…`), which is not a legal filename
-/// character on Windows, so blobs are stored under `sha256-…` instead
-fn blob_file_name(layer_digest: &str) -> String {
-    layer_digest.replace(':', "-")
-}
-
+/// Immutable, content-addressed files. The layer store calls these blocking
+/// methods on the blocking pool, under its concurrency limit.
 #[derive(Clone)]
 pub struct CacheController {
     cache_dir: PathBuf,
-    cached_layers: HashSet<String>,
 }
 
 impl CacheController {
-    pub fn new(cache_dir_path: Option<&str>) -> Result<Self> {
-        let mut controller = CacheController {
-            cache_dir: PathBuf::from(cache_dir_path.unwrap_or(DEFAULT_CACHE_DIR)),
-            cached_layers: HashSet::new(),
-        };
-        controller.create_cache_dir()?;
-        controller.index_cache_dir()?;
-        Ok(controller)
+    pub fn new(cache_dir_path: Option<&Path>) -> Result<Self> {
+        let cache_dir = cache_dir_path
+            .unwrap_or(Path::new(DEFAULT_CACHE_DIR))
+            .to_path_buf();
+        std::fs::create_dir_all(&cache_dir)
+            .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
+        Ok(Self { cache_dir })
     }
 
-    /// Path where the blob with this digest is (or should be) stored
-    pub fn blob_path(&self, layer_digest: &str) -> PathBuf {
-        self.cache_dir.join(blob_file_name(layer_digest))
+    fn blob_path(&self, digest: &Digest) -> PathBuf {
+        self.cache_dir.join(digest.to_string().replace(':', "-"))
     }
 
-    fn create_cache_dir(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.cache_dir)
-            .with_context(|| format!("creating cache dir {:?}", self.cache_dir))?;
-        Ok(())
-    }
-
-    fn index_cache_dir(&mut self) -> Result<()> {
-        for entry in std::fs::read_dir(&self.cache_dir)
-            .with_context(|| format!("reading cache dir {:?}", self.cache_dir))?
-        {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                self.cached_layers
-                    .insert(entry.file_name().to_string_lossy().into_owned());
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn cache_lookup(&self, progress: &Progress, layer_digest: &str) -> Option<PathBuf> {
-        if !self.cached_layers.contains(&blob_file_name(layer_digest)) {
-            return None;
-        }
-        let file_path = self.blob_path(layer_digest);
-        match sha256_digest_file(&file_path) {
-            Ok(cached_layer_sha) if cached_layer_sha.as_ref() == layer_digest => {
-                progress.note(format!("cache hit for layer `{layer_digest}`"));
-                Some(file_path)
-            }
-            Ok(cached_layer_sha) => {
-                progress.err_note(format!(
-                    "cached layer `{layer_digest}` hashes to `{cached_layer_sha}`; re-downloading"
-                ));
-                None
-            }
+    pub fn lookup(
+        &self,
+        digest: &Digest,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<BlobFile>> {
+        let path = self.blob_path(digest);
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                progress.err_note(format!(
-                    "hashing cached layer {file_path:?} failed ({error}); re-downloading"
-                ));
-                None
+                tracing::warn!(path = %path.display(), %error, "cannot read cached layer; re-downloading");
+                return Ok(None);
+            }
+        };
+        match matches_digest(&mut file, digest, cancellation) {
+            Ok(true) => Ok(Some(BlobFile::cached(path))),
+            result => {
+                ensure!(!cancellation.is_cancelled(), "cache verification cancelled");
+                match result {
+                    Ok(false) => {
+                        tracing::warn!(%digest, "cached layer digest mismatch; re-downloading")
+                    }
+                    Err(error) => {
+                        tracing::warn!(%digest, %error, "cannot verify cached layer; re-downloading")
+                    }
+                    Ok(true) => unreachable!(),
+                }
+                Ok(None)
             }
         }
     }
+
+    pub fn staging_file(&self) -> Result<NamedTempFile> {
+        NamedTempFile::new_in(&self.cache_dir).context("creating cache staging file")
+    }
+
+    /// The caller must have verified the downloaded digest and size. Concurrent
+    /// publishers atomically replace the path with identical content, preserving
+    /// the files held by existing readers.
+    pub fn publish(&self, file: NamedTempFile, digest: &Digest) -> Result<BlobFile> {
+        let path = self.blob_path(digest);
+        file.persist(&path)
+            .with_context(|| format!("publishing cached layer {digest}"))?;
+        Ok(BlobFile::cached(path))
+    }
+}
+
+fn matches_digest(
+    file: &mut File,
+    expected: &Digest,
+    cancellation: &CancellationToken,
+) -> Result<bool> {
+    fn hash<D: sha2::Digest>(file: &mut File, cancellation: &CancellationToken) -> Result<String> {
+        let mut hasher = D::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            ensure!(!cancellation.is_cancelled(), "cache verification cancelled");
+            let count = file.read(&mut buffer).context("reading cached layer")?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+    let actual = match expected.algorithm() {
+        DigestAlgorithm::Sha256 => hash::<Sha256>(file, cancellation)?,
+        DigestAlgorithm::Sha512 => hash::<Sha512>(file, cancellation)?,
+        other => anyhow::bail!("unsupported cache digest algorithm {other}"),
+    };
+    Ok(actual == expected.digest())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::digest::sha256_digest;
-    use crate::progress::{Progress, ProgressMode};
-    use tempfile::TempDir;
+    use std::io::Write;
 
     #[test]
-    fn blob_paths_avoid_colons_in_file_names() {
-        let directory = TempDir::new().unwrap();
-        let controller = CacheController::new(directory.path().to_str()).unwrap();
-        let path = controller.blob_path("sha256:abcdef");
-        assert_eq!(path.file_name().unwrap().to_string_lossy(), "sha256-abcdef");
+    fn publication_is_atomic_and_visible_to_existing_controllers() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = CacheController::new(Some(directory.path())).unwrap();
+        let other = cache.clone();
+        let payload = b"complete layer";
+        let digest = sha256_digest(payload);
+        let cancellation = CancellationToken::new();
+        let mut pending = cache.staging_file().unwrap();
+        pending.write_all(b"complete ").unwrap();
+        assert!(other.lookup(&digest, &cancellation).unwrap().is_none());
+        pending.write_all(b"layer").unwrap();
+        cache.publish(pending, &digest).unwrap();
+        let mut reader = other
+            .lookup(&digest, &cancellation)
+            .unwrap()
+            .unwrap()
+            .open()
+            .unwrap();
+        let mut replacement = cache.staging_file().unwrap();
+        replacement.write_all(b"partial").unwrap();
+        drop(replacement);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, payload);
+        assert!(other.lookup(&digest, &cancellation).unwrap().is_some());
+        assert!(
+            !cache
+                .blob_path(&digest)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains(':')
+        );
     }
 
     #[test]
-    fn lookup_returns_only_entries_whose_content_matches_the_digest() {
-        let directory = TempDir::new().unwrap();
-        let cache_dir = directory.path().to_str();
-        let payload = b"layer bytes";
-        let digest = sha256_digest(payload);
-        let progress = Progress::new(ProgressMode::Quiet);
-
-        let controller = CacheController::new(cache_dir).unwrap();
-        std::fs::write(controller.blob_path(digest.as_ref()), payload).unwrap();
-
-        // A fresh controller indexes the directory and serves the hit
-        let controller = CacheController::new(cache_dir).unwrap();
+    fn lookup_rejects_corruption_and_observes_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = CacheController::new(Some(directory.path())).unwrap();
+        let digest = sha256_digest(b"expected");
+        std::fs::write(cache.blob_path(&digest), b"corrupt").unwrap();
+        let cancellation = CancellationToken::new();
+        assert!(cache.lookup(&digest, &cancellation).unwrap().is_none());
+        cancellation.cancel();
+        assert!(cache.lookup(&digest, &cancellation).is_err());
+    }
+    #[test]
+    fn concurrent_publishers_preserve_open_readers() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = CacheController::new(Some(directory.path())).unwrap();
+        let payload = vec![42_u8; 128 * 1024];
+        let digest = sha256_digest(&payload);
+        let mut initial = cache.staging_file().unwrap();
+        initial.write_all(&payload).unwrap();
+        let mut reader = cache.publish(initial, &digest).unwrap().open().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let barrier = &barrier;
+            for _ in 0..2 {
+                let cache = &cache;
+                let digest = &digest;
+                let payload = &payload;
+                scope.spawn(move || {
+                    let mut pending = cache.staging_file().unwrap();
+                    pending.write_all(payload).unwrap();
+                    barrier.wait();
+                    cache.publish(pending, digest).unwrap();
+                });
+            }
+        });
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, payload);
         assert!(
-            controller
-                .cache_lookup(&progress, digest.as_ref())
+            cache
+                .lookup(&digest, &CancellationToken::new())
+                .unwrap()
                 .is_some()
-        );
-
-        // A corrupted entry is rejected instead of being served
-        std::fs::write(controller.blob_path(digest.as_ref()), b"garbage").unwrap();
-        assert!(
-            controller
-                .cache_lookup(&progress, digest.as_ref())
-                .is_none()
-        );
-
-        // An unknown digest is a miss
-        let unknown = sha256_digest(b"never cached");
-        assert!(
-            controller
-                .cache_lookup(&progress, unknown.as_ref())
-                .is_none()
         );
     }
 }

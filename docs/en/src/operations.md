@@ -63,9 +63,12 @@ rib build ... --cache --cache-path /cache/rib
 
 The default path is `./.rib-cache`. Cached blobs are rehashed before reuse.
 This cache stores downloaded base layers only; it neither stores built layers
-nor replaces Cargo/npm caches. Do not let multiple `rib` processes write one
-cache directory concurrently. A direct push to the same registry usually needs
-no local cache because registry-side blob reuse avoids downloads.
+nor replaces Cargo/npm caches. Multiple `rib` processes may share the directory:
+writers use separate staging files and publish atomically after digest and size
+verification. Incomplete downloads never replace complete entries. Cache
+verification runs on the blocking pool under `--jobs` and observes cancellation.
+A direct push to the same registry usually needs no local cache because
+registry-side blob reuse avoids downloads.
 
 ## Network transport
 

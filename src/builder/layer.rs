@@ -2,17 +2,15 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
 
 use crate::builder::copy::{CopySpec, Owner, join_posix, resolve_targets, strip_leading_slash};
 use crate::builder::writers::{HashingWriter, SplitWriter};
 use crate::cancellable_io::CancellableWriter;
-use crate::image::layer::{Layer, LayerStorage};
+use crate::image::layer::Layer;
 use crate::tar_io::{EntryData, write_entry};
 use anyhow::{Context, Result};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use oci_spec::image::{DescriptorBuilder, MediaType};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
@@ -56,21 +54,14 @@ pub(crate) fn build_copy_layer_with_options(
     let compressed_hashing_writer = gz.finish().context("finalizing gzip")?;
     let (digest, size) = compressed_hashing_writer.finalize();
 
-    Ok(Layer {
+    Layer::from_built_tar(
+        tmpdir,
         diff_id,
-        descriptor: DescriptorBuilder::default()
-            .media_type(MediaType::ImageLayerGzip)
-            .digest(digest)
-            .size(size)
-            .build()
-            .context("building layer descriptor")?,
+        digest,
         uncompressed_size,
-        storage: Arc::new(LayerStorage {
-            _dir: tmpdir,
-            compressed_path,
-            uncompressed_path,
-        }),
-    })
+        size,
+        retain_uncompressed,
+    )
 }
 
 fn write_dir_entries<W: Write>(
@@ -91,7 +82,12 @@ fn write_dir_entries<W: Write>(
         let dst_path = if rel.as_os_str().is_empty() {
             dst_root.to_string()
         } else {
-            join_posix(dst_root, &rel.to_string_lossy())
+            join_posix(
+                dst_root,
+                rel.to_str().with_context(|| {
+                    format!("source path is not valid UTF-8: {}", rel.display())
+                })?,
+            )
         };
         let meta = entry.metadata()?;
 
@@ -112,7 +108,7 @@ fn write_dir_entries<W: Write>(
                     &format!("{}/", dst_path.trim_end_matches('/')),
                     EntryData::Dir,
                     None,
-                    spec.chown,
+                    spec.chown(),
                 )?;
             }
         } else if meta.is_file() {
@@ -122,8 +118,8 @@ fn write_dir_entries<W: Write>(
                 builder,
                 &dst_path,
                 EntryData::File(&mut file),
-                spec.mode,
-                spec.chown,
+                spec.mode(),
+                spec.chown(),
             )?;
         } else {
             anyhow::bail!(
@@ -176,20 +172,20 @@ fn write_to_tar<W: Write>(builder: &mut tar::Builder<W>, spec: &CopySpec) -> Res
 
     for entry in &entries {
         if entry.is_dir {
-            ensure_parent_dirs(builder, &entry.dst, &mut dirs_written, spec.chown)?;
+            ensure_parent_dirs(builder, &entry.dst, &mut dirs_written, spec.chown())?;
             // Directory itself is the dst — write it as a directory entry,
             // then walk its CONTENTS into it
             write_dir_entries(builder, &entry.src, &entry.dst, spec, &mut dirs_written)?;
         } else {
-            ensure_parent_dirs(builder, &entry.dst, &mut dirs_written, spec.chown)?;
+            ensure_parent_dirs(builder, &entry.dst, &mut dirs_written, spec.chown())?;
             let mut file = std::fs::File::open(&entry.src)
                 .with_context(|| format!("open {}", entry.src.display()))?;
             write_entry(
                 builder,
                 &entry.dst,
                 EntryData::File(&mut file),
-                spec.mode,
-                spec.chown,
+                spec.mode(),
+                spec.chown(),
             )?;
         }
     }
@@ -199,86 +195,13 @@ fn write_to_tar<W: Write>(builder: &mut tar::Builder<W>, spec: &CopySpec) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
     use tempfile::TempDir;
 
     fn write_tmp(dir: &TempDir, name: &str, content: &[u8]) -> std::path::PathBuf {
         let p = dir.path().join(name);
         std::fs::write(&p, content).unwrap();
         p
-    }
-
-    #[test]
-    fn parse_basic() {
-        let s = CopySpec::parse("./app:/usr/bin/app").unwrap();
-        assert_eq!(s.src, "./app");
-        assert_eq!(s.dst, "/usr/bin/app");
-        assert!(!s.dst_is_explicit_dir);
-        assert_eq!(s.mode, None);
-        assert_eq!(s.chown, None);
-    }
-
-    #[test]
-    fn parse_trailing_slash_marks_dst_as_dir() {
-        let s = CopySpec::parse("./app:/usr/bin/").unwrap();
-        assert!(s.dst_is_explicit_dir);
-        assert_eq!(s.dst, "/usr/bin/");
-    }
-
-    #[test]
-    fn parse_mode_via_options() {
-        let s = CopySpec::parse("./app:/usr/bin/app,mode=0755").unwrap();
-        assert_eq!(s.mode, Some(0o755));
-    }
-
-    #[test]
-    fn parse_chmod_alias_works() {
-        // Dockerfile users know `--chmod=`; accept it as alias for `mode`
-        let s = CopySpec::parse("./app:/x,chmod=0700").unwrap();
-        assert_eq!(s.mode, Some(0o700));
-    }
-
-    #[test]
-    fn parse_chown_uid_gid() {
-        let s = CopySpec::parse("./app:/x,chown=1000:2000").unwrap();
-        assert_eq!(
-            s.chown,
-            Some(Owner {
-                uid: 1000,
-                gid: 2000
-            })
-        );
-    }
-
-    #[test]
-    fn parse_chown_uid_only_defaults_gid_to_zero() {
-        let s = CopySpec::parse("./app:/x,chown=1000").unwrap();
-        assert_eq!(s.chown, Some(Owner { uid: 1000, gid: 0 }));
-    }
-
-    #[test]
-    fn parse_combined_mode_and_chown() {
-        let s = CopySpec::parse("./app:/x,mode=0755,chown=1000:1000").unwrap();
-        assert_eq!(s.mode, Some(0o755));
-        assert_eq!(
-            s.chown,
-            Some(Owner {
-                uid: 1000,
-                gid: 1000
-            })
-        );
-    }
-
-    #[test]
-    fn parse_rejects_bad_input() {
-        assert!(CopySpec::parse("just-a-path").is_err());
-        assert!(CopySpec::parse(":/dst").is_err());
-        assert!(CopySpec::parse("./src:").is_err());
-        assert!(CopySpec::parse("./src:/dst,mode=99x").is_err()); // non-octal
-        assert!(CopySpec::parse("./src:/dst,mode=017777").is_err());
-        assert!(CopySpec::parse("./src:/dst,chown=alice").is_err()); // non-numeric
-        assert!(CopySpec::parse("./src:/dst,unknownopt=1").is_err());
-        assert!(CopySpec::parse("./src:/app/../escape").is_err());
-        assert!(CopySpec::parse("./src:/app//file").is_err());
     }
 
     fn make_tree() -> TempDir {
@@ -308,7 +231,7 @@ mod tests {
     fn dst_with_trailing_slash_keeps_basename() {
         // file -> /app/  →  /app/<basename>
         let dir = make_tree();
-        let spec = CopySpec::parse(&format!("{}/a.txt:/app/", dir.path().display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}/a.txt:/app/", dir.path().display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
         let paths = paths_in_layer(&layer);
         assert!(paths.contains(&"app/a.txt".to_string()), "got {paths:?}");
@@ -321,7 +244,7 @@ mod tests {
         // file -> /app/foo.txt  →  /app/foo.txt (renamed)
         let dir = make_tree();
         let spec =
-            CopySpec::parse(&format!("{}/a.txt:/app/foo.txt", dir.path().display())).unwrap();
+            CopySpec::from_str(&format!("{}/a.txt:/app/foo.txt", dir.path().display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
         let paths = paths_in_layer(&layer);
         assert!(paths.contains(&"app/foo.txt".to_string()), "got {paths:?}");
@@ -332,7 +255,7 @@ mod tests {
         // Docker rule: COPY mydir/ /app/ puts contents of mydir into /app/,
         // it does NOT create /app/mydir/
         let dir = make_tree();
-        let spec = CopySpec::parse(&format!("{}:/app/", dir.path().display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/app/", dir.path().display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
         let paths = paths_in_layer(&layer);
 
@@ -358,7 +281,7 @@ mod tests {
     #[test]
     fn directory_source_copies_contents_to_image_root() {
         let dir = make_tree();
-        let spec = CopySpec::parse(&format!("{}:/", dir.path().display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/", dir.path().display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
         let paths = paths_in_layer(&layer);
 
@@ -374,7 +297,7 @@ mod tests {
     fn assert_long_destination(destination: &str) {
         let dir = TempDir::new().unwrap();
         let source = write_tmp(&dir, "payload", b"payload");
-        let spec = CopySpec::parse(&format!("{}:{destination}", source.display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:{destination}", source.display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
         let paths = paths_in_layer(&layer);
         let expected = destination.trim_start_matches('/');
@@ -404,7 +327,7 @@ mod tests {
     #[test]
     fn glob_expands_to_multiple_files() {
         let dir = make_tree();
-        let spec = CopySpec::parse(&format!("{}/*.txt:/app/", dir.path().display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}/*.txt:/app/", dir.path().display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
         let paths = paths_in_layer(&layer);
         // Both .txt files matched; .md was skipped
@@ -416,7 +339,7 @@ mod tests {
     #[test]
     fn glob_with_no_matches_errors() {
         let dir = TempDir::new().unwrap();
-        let spec = CopySpec::parse(&format!("{}/*.nope:/app/", dir.path().display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}/*.nope:/app/", dir.path().display())).unwrap();
         assert!(build_copy_layer(&spec).is_err());
     }
 
@@ -425,7 +348,7 @@ mod tests {
         // `*.txt → /app/foo` (no slash) is ambiguous — Docker rejects this,
         // and so do we. Caller must add a trailing slash to dst
         let dir = make_tree();
-        let spec = CopySpec::parse(&format!("{}/*.txt:/app/foo", dir.path().display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}/*.txt:/app/foo", dir.path().display())).unwrap();
         let err = build_copy_layer(&spec).unwrap_err();
         assert!(
             format!("{err}").contains("not a directory"),
@@ -441,7 +364,7 @@ mod tests {
         let dir = make_tree();
         let link = dir.path().join("link.txt");
         symlink(dir.path().join("a.txt"), &link).unwrap();
-        let spec = CopySpec::parse(&format!("{}:/app/link.txt", link.display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/app/link.txt", link.display())).unwrap();
         let error = build_copy_layer(&spec).unwrap_err();
         assert!(error.to_string().contains("symlink"));
     }
@@ -450,7 +373,7 @@ mod tests {
     fn chown_propagates_to_file_and_parent_dirs() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("x"), b"x").unwrap();
-        let spec = CopySpec::parse(&format!(
+        let spec = CopySpec::from_str(&format!(
             "{}/x:/app/bin/x,chown=1000:2000",
             dir.path().display()
         ))
@@ -472,13 +395,19 @@ mod tests {
     fn builds_from_single_file() {
         let dir = TempDir::new().unwrap();
         let src = write_tmp(&dir, "hello.txt", b"hello");
-        let spec = CopySpec::parse(&format!("{}:/app/hello.txt", src.display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/app/hello.txt", src.display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
 
-        assert!(layer.diff_id.to_string().starts_with("sha256:"));
-        assert!(layer.descriptor.digest().to_string().starts_with("sha256:"));
+        assert!(layer.diff_id().to_string().starts_with("sha256:"));
+        assert!(
+            layer
+                .descriptor()
+                .digest()
+                .to_string()
+                .starts_with("sha256:")
+        );
         assert!(layer.size() > 0);
-        assert!(layer.uncompressed_size > 0);
+        assert!(layer.uncompressed_size() > 0);
     }
 
     /// The canonical OCI bug: producers that put the gzipped digest into
@@ -487,11 +416,11 @@ mod tests {
     fn diff_id_differs_from_digest() {
         let dir = TempDir::new().unwrap();
         let src = write_tmp(&dir, "x.txt", b"some content here");
-        let spec = CopySpec::parse(&format!("{}:/x.txt", src.display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/x.txt", src.display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
         assert_ne!(
-            layer.diff_id.to_string(),
-            layer.descriptor.digest().to_string(),
+            layer.diff_id().to_string(),
+            layer.descriptor().digest().to_string(),
             "diff_id (uncompressed) must never equal digest (gzipped)"
         );
     }
@@ -500,27 +429,27 @@ mod tests {
     fn skipping_uncompressed_storage_preserves_layer_identity() {
         let dir = TempDir::new().unwrap();
         let source = write_tmp(&dir, "payload", b"payload");
-        let spec = CopySpec::parse(&format!("{}:/payload", source.display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/payload", source.display())).unwrap();
 
         let retained =
             build_copy_layer_with_options(&spec, true, CancellationToken::new()).unwrap();
         let discarded =
             build_copy_layer_with_options(&spec, false, CancellationToken::new()).unwrap();
 
-        assert!(retained.storage.uncompressed_path.is_some());
-        assert!(discarded.storage.uncompressed_path.is_none());
-        assert!(discarded.storage.compressed_path.is_file());
+        assert!(retained.open_uncompressed().is_ok());
         assert!(discarded.open_uncompressed().is_err());
-        assert_eq!(discarded.diff_id, retained.diff_id);
-        assert_eq!(discarded.descriptor, retained.descriptor);
-        assert_eq!(discarded.uncompressed_size, retained.uncompressed_size);
+        assert!(discarded.compressed_path().is_file());
+        assert!(discarded.open_uncompressed().is_err());
+        assert_eq!(discarded.diff_id(), retained.diff_id());
+        assert_eq!(discarded.descriptor(), retained.descriptor());
+        assert_eq!(discarded.uncompressed_size(), retained.uncompressed_size());
     }
 
     #[test]
     fn cancelled_layer_build_stops_before_writing_data() {
         let dir = TempDir::new().unwrap();
         let source = write_tmp(&dir, "payload", b"payload");
-        let spec = CopySpec::parse(&format!("{}:/payload", source.display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/payload", source.display())).unwrap();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
 
@@ -533,7 +462,7 @@ mod tests {
     fn explicit_mode_is_applied() {
         let dir = TempDir::new().unwrap();
         let src = write_tmp(&dir, "x", b"x");
-        let spec = CopySpec::parse(&format!("{}:/x,mode=0700", src.display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/x,mode=0700", src.display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
 
         let uncompressed = layer.uncompressed_bytes().unwrap();
@@ -547,7 +476,7 @@ mod tests {
     fn entries_have_zero_mtime_uid_gid() {
         let dir = TempDir::new().unwrap();
         let src = write_tmp(&dir, "x", b"x");
-        let spec = CopySpec::parse(&format!("{}:/x", src.display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/x", src.display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
 
         let uncompressed = layer.uncompressed_bytes().unwrap();
@@ -569,7 +498,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
         std::fs::write(dir.path().join("m.txt"), b"m").unwrap();
 
-        let spec = CopySpec::parse(&format!("{}:/x", dir.path().display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/x", dir.path().display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
 
         let uncompressed = layer.uncompressed_bytes().unwrap();
@@ -596,7 +525,7 @@ mod tests {
         // OCI/Docker tar convention: no leading slash on entry paths
         let dir = TempDir::new().unwrap();
         let src = write_tmp(&dir, "x", b"x");
-        let spec = CopySpec::parse(&format!("{}:/usr/local/bin/app", src.display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/usr/local/bin/app", src.display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
 
         let uncompressed = layer.uncompressed_bytes().unwrap();
@@ -630,7 +559,7 @@ mod tests {
     fn parent_directories_have_proper_permissions() {
         let dir = TempDir::new().unwrap();
         let src = write_tmp(&dir, "x", b"x");
-        let spec = CopySpec::parse(&format!("{}:/app/bin/server", src.display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/app/bin/server", src.display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
 
         let uncompressed = layer.uncompressed_bytes().unwrap();
@@ -667,14 +596,14 @@ mod tests {
         std::fs::write(dir.path().join("greeting.txt"), b"hello\n").unwrap();
         std::fs::write(dir.path().join("sub/nested.txt"), b"nested\n").unwrap();
 
-        let spec = CopySpec::parse(&format!("{}:/app", dir.path().display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/app", dir.path().display())).unwrap();
         let layer = build_copy_layer(&spec).unwrap();
 
         let compressed = layer.compressed_bytes().unwrap();
         std::fs::write("/tmp/rib-smoke.tar.gz", &compressed).unwrap();
-        eprintln!("diff_id      = {}", layer.diff_id);
-        eprintln!("digest       = {}", layer.descriptor.digest());
-        eprintln!("uncompressed = {} bytes", layer.uncompressed_size);
+        eprintln!("diff_id      = {}", layer.diff_id());
+        eprintln!("digest       = {}", layer.descriptor().digest());
+        eprintln!("uncompressed = {} bytes", layer.uncompressed_size());
         eprintln!("compressed   = {} bytes", layer.size());
         eprintln!("wrote /tmp/rib-smoke.tar.gz");
     }

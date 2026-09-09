@@ -31,22 +31,25 @@ processing.
 | Module | Responsibility |
 |---|---|
 | `cli` | Parses standalone CLI options into a build specification |
-| `cargo_integration` | Runs Cargo metadata and build, selects a workspace package, and merges metadata with CLI options |
-| `app::build` | Validates the request and coordinates the complete build |
+| `cargo_integration` | Coordinates `cli`, `config`, `plan`, and `process` for arguments, metadata, build planning, and Cargo execution |
+| `app::spec` | Defines settings, merges transport overrides, and validates build requests |
+| `app::build` | Coordinates the build |
+| `app::runtime` | Initializes tracing and handles interruption signals |
 | `builder::copy` | Parses `--copy`, expands globs, and resolves image destinations |
 | `builder::layer` | Creates a deterministic tar/gzip layer and its identifiers |
 | `image` | Stores the platform, base image, and layer sources |
 | `image::assemble` | Produces the final configuration, manifest, and `ImageBundle` |
-| `registry` | Wraps `oci-client` for downloads, blob operations, manifest publication, and retries |
+| `registry` | Wraps `oci-client`, preserves manifest bytes, and delegates retry policy to `registry::retry` |
 | `app::push` | Chooses blob reuse, cross-repository mount, or upload |
-| `blob` | Lazily downloads and, for Docker archives, decompresses base layers |
-| `cache` | Indexes and verifies persistent downloaded-base-layer cache entries |
+| `blob` | `LayerStore` shares local files, cache lookup, and downloads; concurrent requests for a digest share one download |
+| `cache` | Verifies cached base layers and publishes complete entries atomically |
 | `archive` | Writes OCI and Docker archives |
 | `auth` | Reads Docker configuration and explicit credentials, and canonicalizes registry names |
 | `progress` | Provides terminal, CI-line, and quiet progress modes |
 
 The `rib` and `cargo-rib` binaries delegate to `rib::run()` and
-`rib::run_cargo()`, keeping lifecycle and error handling shared.
+`rib::run_cargo()`, keeping lifecycle and error handling shared. These entry
+points are internal to the binaries and are not a supported, stable library API.
 
 ## Request normalization
 
@@ -126,7 +129,9 @@ Downloaded base layers are indexed by digest and reused across destinations in
 one run. Without `--cache`, temporary data is removed when its last owner is
 dropped. With `--cache`, base blobs remain under `.rib-cache` or
 `--cache-path` and are verified by digest before reuse. Built `COPY` layers are
-not cached between runs.
+not cached between runs. Verification runs on the blocking pool. Downloads use
+private staging files and publish atomically after validation, so complete blobs
+are never truncated. Each reader opens a separate file with its own cursor.
 
 ## Errors and cancellation
 

@@ -11,6 +11,7 @@ mod tests {
     use std::fs::File;
     use std::io::Read;
     use std::path::Path;
+    use std::str::FromStr;
 
     use anyhow::{Result, bail};
     use oci_spec::image::{ANNOTATION_REF_NAME, ImageIndex};
@@ -50,12 +51,12 @@ mod tests {
     }
 
     fn bundle(contents: &[u8]) -> ImageBundle {
-        let base = Image::scratch(&Platform::parse("linux/amd64").unwrap()).unwrap();
+        let base = Image::scratch(&Platform::from_str("linux/amd64").unwrap()).unwrap();
         let sources = TempDir::new().unwrap();
         let source = sources.path().join("payload");
         std::fs::write(&source, contents).unwrap();
         let layer = build_copy_layer(
-            &CopySpec::parse(&format!("{}:/app/payload", source.display())).unwrap(),
+            &CopySpec::from_str(&format!("{}:/app/payload", source.display())).unwrap(),
         )
         .unwrap();
         assemble(AssembleOptions {
@@ -325,11 +326,11 @@ mod tests {
             LayerSource::FromBase { .. } => panic!("fixture layer must be built"),
         };
         std::fs::set_permissions(
-            &layer.storage.compressed_path,
+            layer.compressed_path(),
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        let layer_path = blob_path(layer.descriptor.digest());
+        let layer_path = blob_path(layer.descriptor().digest());
         let directory = TempDir::new().unwrap();
         let target = directory.path().join("image.tar");
         write_oci_archive(

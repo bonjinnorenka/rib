@@ -92,12 +92,12 @@ fn build_index_json(bundle: &ImageBundle, tag: Option<&str>) -> Result<Vec<u8>> 
 
     let descriptor = descriptor
         .build()
-        .map_err(|error| anyhow::anyhow!("building index manifest descriptor: {error}"))?;
+        .context("building index manifest descriptor")?;
     let index = ImageIndexBuilder::default()
         .schema_version(SCHEMA_VERSION)
         .media_type(MediaType::ImageIndex)
         .manifests(vec![descriptor])
         .build()
-        .map_err(|error| anyhow::anyhow!("building image index: {error}"))?;
+        .context("building image index")?;
     serde_json::to_vec(&index).context("serializing index.json")
 }

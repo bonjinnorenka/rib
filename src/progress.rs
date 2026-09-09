@@ -106,16 +106,6 @@ impl Progress {
         }
     }
 
-    pub fn err_note(&self, message: impl AsRef<str>) {
-        match self.inner.mode {
-            ResolvedMode::Color => {
-                let _ = self.inner.bars.println(format!("  ✗ {}", message.as_ref()));
-            }
-            ResolvedMode::Plain => eprintln!("  ✗ {}", message.as_ref()),
-            ResolvedMode::Quiet => {}
-        }
-    }
-
     pub(crate) fn tracing_writer(&self) -> ProgressMakeWriter {
         ProgressMakeWriter {
             progress: self.clone(),

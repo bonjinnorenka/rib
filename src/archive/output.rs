@@ -69,7 +69,6 @@ pub fn write_image_tar(
     );
     let _published = temporary
         .persist(target)
-        .map_err(|error| error.error)
         .with_context(|| format!("publishing {}", target.display()))?;
     Ok(())
 }

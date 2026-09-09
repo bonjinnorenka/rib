@@ -6,8 +6,8 @@
   there is no `RUN` or Dockerfile parser.
 - Package installation and whiteout layers for removing base files are absent.
 - Symbolic links and special source files are rejected.
-- Absolute Windows source paths containing `:` cannot be used in `--copy`; use
-  relative paths.
+- File names copied into the image must be UTF-8; invalid names are rejected
+  instead of being silently replaced.
 - One invocation creates one platform-specific manifest. Build a multi-platform
   index with another tool or pipeline stage.
 - `scratch` contains no libc, CA certificates, shell, or runtime files.
@@ -16,7 +16,6 @@
 
 - Without `--cache`, downloaded base blobs are removed after the process exits.
 - The cache stores only downloaded base layers, not built `COPY` layers.
-- One cache directory is not safe for concurrent writers.
 - Registry-side blob checks and cross-repository mounts normally make a local
   cache unnecessary for repeated pushes to the same registry.
 
@@ -39,7 +38,7 @@
   digest for tools such as `cosign`.
 ## Possible future work
 
-- caching built layers with safe concurrent access;
+- caching built layers;
 - multi-platform index generation;
 - registry-native referrers for SBOM and provenance;
 - resumable uploads;

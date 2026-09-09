@@ -9,21 +9,23 @@ use oci_spec::image::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Platform {
-    pub os: String,
-    pub architecture: String,
-    pub variant: Option<String>,
+    os: String,
+    architecture: String,
+    variant: Option<String>,
 }
 
-impl Platform {
+impl std::str::FromStr for Platform {
+    type Err = anyhow::Error;
+
     /// Parse "<os>/<arch>" or "<os>/<arch>/<variant>" (e.g. "linux/arm64/v8")
-    pub fn parse(s: &str) -> Result<Self> {
+    fn from_str(s: &str) -> Result<Self> {
         let parts: Vec<&str> = s.split('/').collect();
         let (os, arch, variant) = match parts.as_slice() {
             [os, arch] => (*os, *arch, None),
             [os, arch, var] => (*os, *arch, Some(var.to_string())),
             _ => bail!("bad platform, expected <os>/<arch>[/<variant>]: {s}"),
         };
-        if os.is_empty() || arch.is_empty() {
+        if os.is_empty() || arch.is_empty() || variant.as_deref() == Some("") {
             bail!("bad platform, empty os or architecture: {s}");
         }
         Ok(Self {
@@ -32,7 +34,9 @@ impl Platform {
             variant,
         })
     }
+}
 
+impl Platform {
     /// True iff this platform matches a manifest-list descriptor or config
     pub fn matches(&self, os: &str, arch: &str, variant: Option<&str>) -> bool {
         if self.os != os || self.architecture != arch {
@@ -107,36 +111,38 @@ impl ImageSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn platform_parse_and_display() {
-        let basic = Platform::parse("linux/amd64").unwrap();
+        let basic = Platform::from_str("linux/amd64").unwrap();
         assert_eq!(basic.os, "linux");
         assert_eq!(basic.architecture, "amd64");
         assert_eq!(basic.variant, None);
         assert_eq!(basic.to_string(), "linux/amd64");
 
-        let variant = Platform::parse("linux/arm64/v8").unwrap();
+        let variant = Platform::from_str("linux/arm64/v8").unwrap();
         assert_eq!(variant.variant.as_deref(), Some("v8"));
         assert_eq!(variant.to_string(), "linux/arm64/v8");
     }
 
     #[test]
     fn platform_rejects_malformed_values() {
-        assert!(Platform::parse("just-os").is_err());
-        assert!(Platform::parse("linux//amd64").is_err());
-        assert!(Platform::parse("linux/amd64/v8/extra").is_err());
-        assert!(Platform::parse("/amd64").is_err());
+        assert!(Platform::from_str("just-os").is_err());
+        assert!(Platform::from_str("linux//amd64").is_err());
+        assert!(Platform::from_str("linux/amd64/v8/extra").is_err());
+        assert!(Platform::from_str("/amd64").is_err());
+        assert!(Platform::from_str("linux/arm64/").is_err());
     }
 
     #[test]
     fn platform_matching_handles_variants() {
-        let generic = Platform::parse("linux/arm64").unwrap();
+        let generic = Platform::from_str("linux/arm64").unwrap();
         assert!(generic.matches("linux", "arm64", None));
         assert!(generic.matches("linux", "arm64", Some("v8")));
         assert!(!generic.matches("linux", "amd64", None));
 
-        let specific = Platform::parse("linux/arm64/v8").unwrap();
+        let specific = Platform::from_str("linux/arm64/v8").unwrap();
         assert!(specific.matches("linux", "arm64", Some("v8")));
         assert!(!specific.matches("linux", "arm64", None));
         assert!(!specific.matches("linux", "arm64", Some("v7")));
@@ -144,7 +150,7 @@ mod tests {
 
     #[test]
     fn scratch_uses_the_requested_platform_and_has_no_registry_source() {
-        let scratch = Image::scratch(&Platform::parse("linux/arm64/v8").unwrap()).unwrap();
+        let scratch = Image::scratch(&Platform::from_str("linux/arm64/v8").unwrap()).unwrap();
 
         assert!(scratch.source.is_none());
         assert!(scratch.layers.is_empty());

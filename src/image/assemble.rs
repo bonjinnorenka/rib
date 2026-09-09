@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use oci_spec::image::{
     ANNOTATION_BASE_IMAGE_DIGEST, ANNOTATION_BASE_IMAGE_NAME, ANNOTATION_CREATED, Descriptor,
@@ -39,7 +39,7 @@ pub struct ImageBundle {
 pub fn assemble(options: AssembleOptions) -> Result<ImageBundle> {
     validate_layer_count(&options.base.config, options.base.layers.len())?;
 
-    let mut config = options.base.config.clone();
+    let mut config = options.base.config;
     let created = options
         .creation_time
         .clone()
@@ -51,7 +51,7 @@ pub fn assemble(options: AssembleOptions) -> Result<ImageBundle> {
         options
             .new_layers
             .iter()
-            .map(|layer| layer.diff_id.to_string()),
+            .map(|layer| layer.diff_id().to_string()),
     );
     config.rootfs_mut().set_diff_ids(diff_ids);
 
@@ -112,7 +112,7 @@ pub fn assemble(options: AssembleOptions) -> Result<ImageBundle> {
         .digest(config_digest.clone())
         .size(config_bytes.len() as u64)
         .build()
-        .map_err(|error| anyhow!("building config descriptor: {error}"))?;
+        .context("building config descriptor")?;
 
     let mut layers = Vec::with_capacity(options.base.layers.len() + options.new_layers.len());
     if !options.base.layers.is_empty() {
@@ -161,7 +161,7 @@ pub fn assemble(options: AssembleOptions) -> Result<ImageBundle> {
         .layers(layer_descriptors)
         .annotations(annotations)
         .build()
-        .map_err(|error| anyhow!("building manifest: {error}"))?;
+        .context("building manifest")?;
     let manifest_bytes = canonical_json(&manifest).context("serializing manifest")?;
     let manifest_digest = sha256_digest(&manifest_bytes);
 
@@ -207,10 +207,10 @@ fn history_entry(created: &str, layer: &Layer) -> Result<History> {
         .created(created.to_string())
         .created_by(format!(
             "rib copy ({} bytes uncompressed)",
-            layer.uncompressed_size
+            layer.uncompressed_size()
         ))
         .build()
-        .map_err(|error| anyhow!("building history entry: {error}"))
+        .context("building history entry")
 }
 
 fn canonical_json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -226,6 +226,7 @@ mod tests {
     use crate::digest::sha256_digest;
     use crate::image::{ImageSource, Platform};
     use oci_spec::image::{Arch, ConfigBuilder, ImageConfigurationBuilder, Os, RootFsBuilder};
+    use std::str::FromStr;
     use tempfile::TempDir;
 
     fn base(layer_count: usize, with_history: bool) -> Image {
@@ -276,7 +277,7 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join(name);
         std::fs::write(&path, contents).unwrap();
-        let spec = CopySpec::parse(&format!("{}:/app/{name}", path.display())).unwrap();
+        let spec = CopySpec::from_str(&format!("{}:/app/{name}", path.display())).unwrap();
         build_copy_layer(&spec).unwrap()
     }
 
@@ -299,8 +300,8 @@ mod tests {
     fn appends_layers_and_history_in_order() {
         let first = layer("first", b"1");
         let second = layer("second", b"2");
-        let first_diff = first.diff_id.to_string();
-        let second_diff = second.diff_id.to_string();
+        let first_diff = first.diff_id().to_string();
+        let second_diff = second.diff_id().to_string();
         let bundle = assemble(options(base(2, true), vec![first, second])).unwrap();
 
         assert_eq!(
@@ -458,7 +459,7 @@ mod tests {
 
     #[test]
     fn scratch_has_only_created_annotation_and_appends_copy_history() {
-        let scratch = Image::scratch(&Platform::parse("linux/arm64/v8").unwrap()).unwrap();
+        let scratch = Image::scratch(&Platform::from_str("linux/arm64/v8").unwrap()).unwrap();
         let bundle = assemble(options(scratch, vec![layer("payload", b"x")])).unwrap();
         let manifest: oci_spec::image::ImageManifest =
             serde_json::from_slice(&bundle.manifest_bytes).unwrap();

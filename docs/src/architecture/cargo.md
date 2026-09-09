@@ -156,8 +156,10 @@ metadata. Они задаются флагами `--credential`, `--docker-confi
   `user`, `creation-time`, `jobs`, `cache-path`, сетевые тайм-ауты и
   `max-attempts`, переданные через CLI, заменяют соответствующие значения
   metadata.
-- Булевы значения объединяются логическим ИЛИ. Флаг CLI может включить опцию,
-  но не может отключить значение `true` из metadata.
+- Явно переданные булевы флаги заменяют metadata: `--cache` и `--cache=true`
+  включают опцию, `--cache=false` отключает её. Аналогично работают
+  `--keep-cmd`, `--from-plain-http`, `--from-skip-tls`, `--to-plain-http`
+  и `--to-skip-tls`. Без флага сохраняется значение metadata.
 - `to`, `copies`, `labels`, `ports` и аргументы Cargo дополняются: сначала
   используются значения metadata, затем CLI.
 - Artifact всегда добавляется последним слоем и не может быть перекрыт более

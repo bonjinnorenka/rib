@@ -109,3 +109,7 @@ multi-platform indexes, or provide a stable Rust library API.
 ## License
 
 Licensed under the MIT License.
+
+The `rib` library crate shares implementation between the `rib` and `cargo-rib`
+binaries. Its entry points are internal to these applications and are not a
+supported, stable library API.

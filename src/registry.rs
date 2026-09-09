@@ -1,26 +1,26 @@
 // Adapter around oci-client. OCI descriptors are converted to oci-spec at the
 // boundary; layer blobs remain lazy so pushes can cross-mount them
 
+mod retry;
 mod token;
+use retry::{RetryPolicy, retry_registry};
 
 use std::fs::File;
-use std::future::Future;
 use std::io::{Seek, SeekFrom};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use futures_util::TryStreamExt;
 use oci_client::client::{ClientConfig, ClientProtocol};
-use oci_client::errors::{OciDistributionError, OciErrorCode};
-use oci_client::manifest::{OciDescriptor, OciManifest};
+use oci_client::errors::OciDistributionError;
+use oci_client::manifest::OciDescriptor;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 use oci_spec::image::{Descriptor, DescriptorBuilder, Digest, ImageConfiguration, MediaType};
 use secrecy::ExposeSecret;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use tracing::warn;
 
@@ -35,13 +35,6 @@ const UPLOAD_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_MAX_ATTEMPTS: usize = 3;
-
-#[derive(Clone, Copy)]
-struct RetryPolicy {
-    max_attempts: usize,
-    initial_delay: Duration,
-    max_delay: Duration,
-}
 
 /// Transport options for one registry-client role. Pull and push use separate
 /// clients so disabling TLS verification for a development source cannot
@@ -221,9 +214,9 @@ impl RegistryClient {
         &self,
         reference: &Reference,
         descriptor: &Descriptor,
-        file_path: Option<&PathBuf>,
+        file: &mut File,
         on_progress: F,
-    ) -> Result<File>
+    ) -> Result<()>
     where
         F: Fn(u64) + Send + Sync,
     {
@@ -233,7 +226,7 @@ impl RegistryClient {
             media_type: descriptor.media_type().to_string(),
             digest: descriptor.digest().to_string(),
             size: i64::try_from(descriptor.size())
-                .map_err(|_| anyhow!("descriptor size doesn't fit in i64"))?,
+                .context("descriptor size does not fit in i64")?,
             urls: descriptor.urls().clone(),
             annotations: descriptor
                 .annotations()
@@ -242,11 +235,12 @@ impl RegistryClient {
             artifact_type: descriptor.artifact_type().as_ref().map(ToString::to_string),
         };
 
+        let destination = file.try_clone().context("cloning download file")?;
         let on_progress = Arc::new(on_progress);
         let reported_bytes = AtomicU64::new(0);
         retry_registry("pull blob", self.retry_policy, || {
             self.fetch_layer_once(
-                file_path,
+                &destination,
                 reference,
                 &oc,
                 on_progress.as_ref(),
@@ -259,33 +253,19 @@ impl RegistryClient {
 
     async fn fetch_layer_once<F>(
         &self,
-        file_path: Option<&PathBuf>,
+        file: &File,
         reference: &Reference,
         descriptor: &OciDescriptor,
         on_progress: &F,
         reported_bytes: &AtomicU64,
-    ) -> oci_client::errors::Result<File>
+    ) -> oci_client::errors::Result<()>
     where
         F: Fn(u64) + Sync + ?Sized,
     {
-        let std_file = match file_path {
-            Some(path) => {
-                tokio::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(path)
-                    .await?
-                    .into_std()
-                    .await
-            }
-            None => tokio::task::spawn_blocking(tempfile::tempfile)
-                .await
-                .expect("blocking task panicked")?,
-        };
-
-        let mut writer = tokio::fs::File::from_std(std_file);
+        // The caller owns a private staging file. Retries reset only that file.
+        let mut writer = tokio::fs::File::from_std(file.try_clone()?);
+        writer.set_len(0).await?;
+        writer.seek(SeekFrom::Start(0)).await?;
         let mut stream = self.inner.pull_blob_stream(reference, descriptor).await?;
         let mut attempt_bytes = 0_u64;
         let mut hasher = Sha256::new();
@@ -300,7 +280,13 @@ impl RegistryClient {
         writer.flush().await?;
         writer.sync_all().await?;
         verify_layer_digest(&descriptor.digest, hasher)?;
-        Ok(writer.into_std().await)
+        if attempt_bytes != descriptor.size as u64 {
+            return Err(OciDistributionError::SpecViolationError(format!(
+                "blob size mismatch: expected {}, received {attempt_bytes}",
+                descriptor.size
+            )));
+        }
+        Ok(())
     }
 
     /// Check if a blob already exists in the target repository
@@ -423,10 +409,15 @@ impl RegistryClient {
 
     pub async fn push_manifest(&self, reference: &Reference, manifest_json: &[u8]) -> Result<()> {
         self.ensure_auth(reference).await;
-        let manifest: OciManifest =
-            serde_json::from_slice(manifest_json).context("parsing OCI manifest JSON")?;
+        let body = bytes::Bytes::copy_from_slice(manifest_json);
         retry_registry("push manifest", self.retry_policy, || {
-            self.inner.push_manifest(reference, &manifest)
+            self.inner.push_manifest_raw(
+                reference,
+                body.clone(),
+                reqwest::header::HeaderValue::from_static(
+                    "application/vnd.oci.image.manifest.v1+json",
+                ),
+            )
         })
         .await
         .with_context(|| format!("pushing manifest to {reference}"))?;
@@ -482,124 +473,15 @@ where
     }
 }
 
-async fn retry_registry<T, F, Fut>(
-    operation: &str,
-    policy: RetryPolicy,
-    mut action: F,
-) -> oci_client::errors::Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = oci_client::errors::Result<T>>,
-{
-    debug_assert!(policy.max_attempts > 0);
-    let mut attempt = 1;
-    loop {
-        match action().await {
-            Ok(value) => return Ok(value),
-            Err(error) if attempt < policy.max_attempts && is_retryable_registry_error(&error) => {
-                let delay = policy.delay_after(attempt);
-                warn!(
-                    operation,
-                    attempt,
-                    max_attempts = policy.max_attempts,
-                    delay_ms = delay.as_millis(),
-                    error = %error,
-                    "transient registry operation failed; retrying"
-                );
-                tokio::time::sleep(delay).await;
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-impl RetryPolicy {
-    fn delay_after(self, failed_attempt: usize) -> Duration {
-        let exponent = u32::try_from(failed_attempt.saturating_sub(1))
-            .unwrap_or(u32::MAX)
-            .min(31);
-        let base = self
-            .initial_delay
-            .saturating_mul(1_u32 << exponent)
-            .min(self.max_delay);
-        if base.is_zero() || base == self.max_delay {
-            return base;
-        }
-
-        // A small additive jitter prevents concurrent builders from retrying
-        let window = base / 4;
-        let window_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
-        let entropy = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-        let jitter = Duration::from_nanos(entropy % window_nanos.saturating_add(1));
-        base.saturating_add(jitter).min(self.max_delay)
-    }
-}
-
-fn is_retryable_registry_error(error: &OciDistributionError) -> bool {
-    match error {
-        OciDistributionError::RequestError(error) => {
-            error.is_timeout()
-                || error.is_connect()
-                || error.is_body()
-                || error
-                    .status()
-                    .is_some_and(|status| is_retryable_status(status.as_u16()))
-        }
-        OciDistributionError::ServerError { code, .. } => is_retryable_status(*code),
-        OciDistributionError::RegistryError { envelope, .. } => {
-            !envelope.errors.is_empty()
-                && envelope
-                    .errors
-                    .iter()
-                    .all(|error| error.code == OciErrorCode::Toomanyrequests)
-        }
-        OciDistributionError::IoError(error) => is_retryable_io_error(error),
-        _ => false,
-    }
-}
-
-fn is_retryable_status(status: u16) -> bool {
-    matches!(status, 408 | 425 | 429 | 500 | 502..=599)
-}
-
-fn is_retryable_io_error(error: &std::io::Error) -> bool {
-    use std::io::ErrorKind;
-
-    match error.kind() {
-        ErrorKind::BrokenPipe
-        | ErrorKind::ConnectionAborted
-        | ErrorKind::ConnectionRefused
-        | ErrorKind::ConnectionReset
-        | ErrorKind::HostUnreachable
-        | ErrorKind::Interrupted
-        | ErrorKind::NetworkDown
-        | ErrorKind::NetworkUnreachable
-        | ErrorKind::NotConnected
-        | ErrorKind::TimedOut
-        | ErrorKind::UnexpectedEof
-        | ErrorKind::WouldBlock => true,
-        ErrorKind::Other => error.get_ref().is_some_and(|source| {
-            source
-                .downcast_ref::<oci_client::errors::DigestError>()
-                .is_none()
-        }),
-        _ => false,
-    }
-}
-
 /// Bridge oci-client's descriptor type to oci-spec's
 fn to_oci_spec_descriptor(d: &OciDescriptor) -> Result<Descriptor> {
     let media_type = MediaType::from(d.media_type.as_str());
-    let size: u64 =
-        u64::try_from(d.size).map_err(|_| anyhow!("descriptor size is negative: {}", d.size))?;
+    let size: u64 = u64::try_from(d.size)
+        .with_context(|| format!("descriptor size is negative: {}", d.size))?;
     let digest: oci_spec::image::Digest = d
         .digest
         .parse()
-        .map_err(|e| anyhow!("malformed descriptor digest {}: {}", d.digest, e))?;
+        .with_context(|| format!("malformed descriptor digest {}", d.digest))?;
     let mut b = DescriptorBuilder::default()
         .media_type(media_type)
         .digest(digest)
@@ -617,30 +499,15 @@ fn to_oci_spec_descriptor(d: &OciDescriptor) -> Result<Descriptor> {
     if let Some(artifact_type) = &d.artifact_type {
         b = b.artifact_type(MediaType::from(artifact_type.as_str()));
     }
-    b.build().map_err(|e| anyhow!("building descriptor: {e}"))
+    b.build().context("building descriptor")
 }
 
 #[cfg(test)]
 mod tests {
+    use super::retry::is_retryable_registry_error;
     use super::*;
     use oci_spec::image::{Arch, ImageConfigurationBuilder, Os, RootFsBuilder};
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-    fn retry_policy_for_test(max_attempts: usize) -> RetryPolicy {
-        RetryPolicy {
-            max_attempts,
-            initial_delay: Duration::ZERO,
-            max_delay: Duration::ZERO,
-        }
-    }
-
-    fn server_error(code: u16) -> OciDistributionError {
-        OciDistributionError::ServerError {
-            code,
-            url: "https://registry.example.test/v2/".to_string(),
-            message: "fixture".to_string(),
-        }
-    }
+    use std::str::FromStr;
 
     fn image_config(os: Os, architecture: Arch, variant: Option<&str>) -> ImageConfiguration {
         let rootfs = RootFsBuilder::default()
@@ -706,9 +573,9 @@ mod tests {
     #[test]
     fn base_config_must_match_requested_platform() {
         let config = image_config(Os::Linux, Arch::Amd64, None);
-        assert!(validate_platform(&Platform::parse("linux/amd64").unwrap(), &config).is_ok());
+        assert!(validate_platform(&Platform::from_str("linux/amd64").unwrap(), &config).is_ok());
 
-        let error = validate_platform(&Platform::parse("linux/arm64").unwrap(), &config)
+        let error = validate_platform(&Platform::from_str("linux/arm64").unwrap(), &config)
             .unwrap_err()
             .to_string();
         assert!(error.contains("linux/amd64"));
@@ -718,8 +585,10 @@ mod tests {
     #[test]
     fn platform_variant_is_checked_when_both_sides_provide_one() {
         let config = image_config(Os::Linux, Arch::ARM64, Some("v8"));
-        assert!(validate_platform(&Platform::parse("linux/arm64/v8").unwrap(), &config).is_ok());
-        assert!(validate_platform(&Platform::parse("linux/arm64/v7").unwrap(), &config).is_err());
+        assert!(validate_platform(&Platform::from_str("linux/arm64/v8").unwrap(), &config).is_ok());
+        assert!(
+            validate_platform(&Platform::from_str("linux/arm64/v7").unwrap(), &config).is_err()
+        );
     }
 
     #[test]
@@ -740,70 +609,6 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(b"payload");
         assert!(verify_layer_digest(sha256_digest(b"payload").as_ref(), hasher).is_ok());
-    }
-
-    #[test]
-    fn retry_classifier_rejects_integrity_and_authentication_errors() {
-        let digest_error = oci_client::errors::DigestError::VerificationError {
-            expected: "sha256:expected".to_string(),
-            actual: "sha256:actual".to_string(),
-        };
-        let digest_io = OciDistributionError::IoError(std::io::Error::other(digest_error));
-        assert!(!is_retryable_registry_error(&digest_io));
-        assert!(!is_retryable_registry_error(
-            &OciDistributionError::UnauthorizedError {
-                url: "https://registry.example.test/v2/".to_string()
-            }
-        ));
-        assert!(is_retryable_registry_error(&server_error(429)));
-        assert!(is_retryable_registry_error(&server_error(503)));
-    }
-
-    #[test]
-    fn retry_delay_has_bounded_jitter() {
-        let policy = RetryPolicy {
-            max_attempts: 3,
-            initial_delay: Duration::from_millis(100),
-            max_delay: Duration::from_secs(1),
-        };
-
-        let delay = policy.delay_after(1);
-
-        assert!(delay >= Duration::from_millis(100));
-        assert!(delay <= Duration::from_millis(125));
-    }
-
-    #[tokio::test]
-    async fn transient_registry_errors_are_retried_with_a_bound() {
-        let attempts = AtomicUsize::new(0);
-        let result = retry_registry("fixture", retry_policy_for_test(3), || {
-            let attempt = attempts.fetch_add(1, AtomicOrdering::Relaxed);
-            std::future::ready(if attempt < 2 {
-                Err(server_error(503))
-            } else {
-                Ok(42)
-            })
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(result, 42);
-        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 3);
-    }
-
-    #[tokio::test]
-    async fn permanent_registry_errors_are_not_retried() {
-        let attempts = AtomicUsize::new(0);
-        let result = retry_registry("fixture", retry_policy_for_test(3), || {
-            attempts.fetch_add(1, AtomicOrdering::Relaxed);
-            std::future::ready(Err::<(), _>(OciDistributionError::UnauthorizedError {
-                url: "https://registry.example.test/v2/".to_string(),
-            }))
-        })
-        .await;
-
-        assert!(result.is_err());
-        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[tokio::test]

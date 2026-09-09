@@ -122,8 +122,10 @@ from metadata. Supply them through `--credential`, `--docker-config`, and
 ## Metadata and CLI merging
 
 - CLI scalar values replace metadata values.
-- Booleans use logical OR: CLI can enable an option but cannot disable a
-  metadata value of `true`.
+- Explicit boolean flags replace metadata: `--cache` and `--cache=true`
+  enable caching, while `--cache=false` disables it. The same syntax applies
+  to `--keep-cmd`, `--from-plain-http`, `--from-skip-tls`, `--to-plain-http`,
+  and `--to-skip-tls`. Omitting the flag retains the metadata value.
 - `to`, `copies`, `labels`, `ports`, and Cargo arguments are concatenated with
   metadata values first.
 - The artifact is always the final layer.

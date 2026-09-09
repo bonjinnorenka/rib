@@ -1,17 +1,14 @@
 use std::collections::HashSet;
-use std::fs::File;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use indicatif::HumanBytes;
 use oci_client::Reference;
-use oci_spec::image::Descriptor;
 
-use crate::blob::DownloadedLayers;
-use crate::cache::CacheController;
+use crate::blob::LayerStore;
 use crate::digest::short_digest;
 use crate::image::assemble::ImageBundle;
-use crate::image::{ImageSource, layer::LayerSource};
+use crate::image::layer::LayerSource;
 use crate::progress::Progress;
 use crate::registry::RegistryClient;
 
@@ -22,18 +19,12 @@ enum LayerPush {
     Uploaded,
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct LocalLayers {
-    pub(crate) downloaded: Arc<DownloadedLayers>,
-    pub(crate) cache: Option<CacheController>,
-}
-
 pub(crate) async fn push_registry(
     source_client: Option<&RegistryClient>,
     target_client: &RegistryClient,
     reference: &Reference,
     bundle: &ImageBundle,
-    local_layers: LocalLayers,
+    local_layers: Arc<LayerStore>,
     jobs: usize,
     progress: Progress,
 ) -> Result<()> {
@@ -126,7 +117,7 @@ async fn push_one_layer(
     reference: &Reference,
     target_registry: &str,
     layer: LayerSource,
-    local_layers: LocalLayers,
+    local_layers: Arc<LayerStore>,
     progress: Progress,
 ) -> Result<LayerPush> {
     let descriptor = layer.descriptor().clone();
@@ -167,9 +158,10 @@ async fn push_one_layer(
 
     let mut file = match &layer {
         LayerSource::Built(layer) => layer.open_compressed()?,
-        LayerSource::FromBase { source, descriptor } => {
-            base_layer_file(source_client, source, descriptor, &local_layers, &progress).await?
-        }
+        LayerSource::FromBase { source, descriptor } => local_layers
+            .get(source_client, source, descriptor, &progress)
+            .await?
+            .open()?,
     };
 
     let task = progress.bytes(format!("push layer {}", short_digest(&digest)), size);
@@ -185,68 +177,13 @@ async fn push_one_layer(
     Ok(LayerPush::Uploaded)
 }
 
-async fn base_layer_file(
-    source_client: Option<&RegistryClient>,
-    source: &ImageSource,
-    descriptor: &Descriptor,
-    local_layers: &LocalLayers,
-    progress: &Progress,
-) -> Result<File> {
-    let digest = descriptor.digest();
-    if let Some(file) = local_layers.downloaded.blob_file_by_digest(digest)? {
-        return Ok(file);
-    }
-
-    let file = match local_layers
-        .cache
-        .as_ref()
-        .and_then(|cache| cache.cache_lookup(progress, digest.as_ref()))
-    {
-        Some(cached) => {
-            File::open(&cached).with_context(|| format!("opening cached layer {cached:?}"))?
-        }
-        None => {
-            // With the cache enabled the blob is downloaded straight into the
-            // cache directory; otherwise into an anonymous tempfile
-            let file_path = local_layers
-                .cache
-                .as_ref()
-                .map(|cache| cache.blob_path(digest.as_ref()));
-            let source_client =
-                source_client.context("base layer requires a source registry client")?;
-            let task = progress.bytes(
-                format!("pull layer {}", short_digest(digest)),
-                descriptor.size(),
-            );
-            let bar = task.progress_bar();
-            let file = source_client
-                .fetch_layer_to_file(
-                    &source.repository_reference(),
-                    descriptor,
-                    file_path.as_ref(),
-                    move |bytes| {
-                        if let Some(bar) = &bar {
-                            bar.inc(bytes);
-                        }
-                    },
-                )
-                .await?;
-            task.done();
-            file
-        }
-    };
-    local_layers.downloaded.fix_blob(digest.clone(), &file)?;
-    Ok(file)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use oci_spec::image::{DescriptorBuilder, Digest, MediaType};
-    use std::io::{Read, Seek, SeekFrom, Write};
 
     use crate::digest::sha256_digest;
-    use crate::progress::ProgressMode;
+    use crate::image::ImageSource;
 
     fn base_layer(digest: Digest, size: u64) -> LayerSource {
         LayerSource::FromBase {
@@ -281,39 +218,5 @@ mod tests {
         assert_eq!(unique[0].descriptor().digest(), &repeated);
         assert_eq!(unique[0].descriptor().size(), 10);
         assert_eq!(unique[1].descriptor().digest(), &other);
-    }
-
-    #[tokio::test]
-    async fn remembered_base_layer_does_not_require_another_download() {
-        let payload = b"downloaded once";
-        let layer = base_layer(sha256_digest(payload), payload.len() as u64);
-        let LayerSource::FromBase { source, descriptor } = layer else {
-            panic!("fixture must be a base layer");
-        };
-        let downloaded = Arc::new(DownloadedLayers::empty());
-        let mut file = tempfile::tempfile().unwrap();
-        file.write_all(payload).unwrap();
-        downloaded
-            .fix_blob(descriptor.digest().clone(), &file)
-            .unwrap();
-        let local_layers = LocalLayers {
-            downloaded,
-            cache: None,
-        };
-
-        let mut reused = base_layer_file(
-            None,
-            &source,
-            &descriptor,
-            &local_layers,
-            &Progress::new(ProgressMode::Quiet),
-        )
-        .await
-        .unwrap();
-
-        reused.seek(SeekFrom::Start(0)).unwrap();
-        let mut bytes = Vec::new();
-        reused.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, payload);
     }
 }

@@ -3,25 +3,67 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use oci_spec::image::{Descriptor, Digest};
+use oci_spec::image::{Descriptor, DescriptorBuilder, Digest, MediaType};
 
 #[derive(Debug, Clone)]
 pub struct Layer {
     /// Digest of the uncompressed tar used by config.rootfs.diff_ids
-    pub diff_id: Digest,
-    pub descriptor: Descriptor,
-    pub uncompressed_size: u64,
-    pub storage: Arc<LayerStorage>,
+    diff_id: Digest,
+    descriptor: Descriptor,
+    uncompressed_size: u64,
+    storage: Arc<LayerStorage>,
 }
 
 #[derive(Debug)]
-pub struct LayerStorage {
-    pub _dir: tempfile::TempDir,
-    pub compressed_path: PathBuf,
-    pub uncompressed_path: Option<PathBuf>,
+struct LayerStorage {
+    _dir: tempfile::TempDir,
+    compressed_path: PathBuf,
+    uncompressed_path: Option<PathBuf>,
 }
 
 impl Layer {
+    pub(crate) fn from_built_tar(
+        directory: tempfile::TempDir,
+        diff_id: Digest,
+        digest: Digest,
+        uncompressed_size: u64,
+        compressed_size: u64,
+        retain_uncompressed: bool,
+    ) -> Result<Self> {
+        let compressed_path = directory.path().join("layer.tar.gz");
+        let uncompressed_path = retain_uncompressed.then(|| directory.path().join("layer.tar"));
+        Ok(Self {
+            diff_id,
+            descriptor: DescriptorBuilder::default()
+                .media_type(MediaType::ImageLayerGzip)
+                .digest(digest)
+                .size(compressed_size)
+                .build()
+                .context("building layer descriptor")?,
+            uncompressed_size,
+            storage: Arc::new(LayerStorage {
+                _dir: directory,
+                compressed_path,
+                uncompressed_path,
+            }),
+        })
+    }
+
+    pub fn diff_id(&self) -> &Digest {
+        &self.diff_id
+    }
+    pub fn descriptor(&self) -> &Descriptor {
+        &self.descriptor
+    }
+    pub fn uncompressed_size(&self) -> u64 {
+        self.uncompressed_size
+    }
+
+    #[cfg(test)]
+    pub fn compressed_path(&self) -> &std::path::Path {
+        &self.storage.compressed_path
+    }
+
     pub fn size(&self) -> u64 {
         self.descriptor.size()
     }
@@ -73,7 +115,7 @@ pub enum LayerSource {
 impl LayerSource {
     pub fn descriptor(&self) -> &Descriptor {
         match self {
-            Self::Built(layer) => &layer.descriptor,
+            Self::Built(layer) => layer.descriptor(),
             Self::FromBase { descriptor, .. } => descriptor,
         }
     }

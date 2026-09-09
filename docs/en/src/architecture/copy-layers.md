@@ -21,8 +21,10 @@ UID and GID (GID defaults to UID when omitted).
 ```
 
 Quote globs so the shell does not expand them before `rib` receives them.
-Absolute Windows source paths containing `:` are unsupported; use a relative
-path from the appropriate directory.
+Windows drive paths are supported, for example
+`--copy 'C:\project\app.exe:/app/app.exe'`. Artifact paths are treated literally,
+including names containing glob characters. Names copied into the image must
+be UTF-8; invalid names produce an error instead of a lossy replacement.
 
 ## Resolving sources and destinations
 

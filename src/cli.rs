@@ -4,12 +4,11 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
-use crate::app::build::{
-    CacheSpec, CopyDirective, ImageBuildSpec, RegistryClientSpec, default_jobs, parse_argv,
+use crate::app::spec::{
+    CacheSpec, CopyDirective, ImageBuildSpec, RegistryOverrides, default_jobs, parse_argv,
 };
 use crate::output_target::OutputTarget;
 use crate::progress::ProgressMode;
-use crate::registry::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_ATTEMPTS, DEFAULT_READ_TIMEOUT};
 
 #[derive(Parser)]
 #[command(name = "rib", version, about = "Minimal jib-like OCI image builder")]
@@ -75,8 +74,8 @@ pub struct ImageConfigArgs {
     pub user: Option<String>,
 
     /// Keep the base image Cmd when overriding entrypoint
-    #[arg(long)]
-    pub keep_cmd: bool,
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub keep_cmd: Option<bool>,
 }
 
 /// Registry transport arguments shared by both binaries. Timeouts stay
@@ -85,8 +84,8 @@ pub struct ImageConfigArgs {
 #[derive(Args)]
 pub struct RegistryClientArgs {
     /// Use HTTP for the source registry
-    #[arg(long)]
-    pub from_plain_http: bool,
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub from_plain_http: Option<bool>,
 
     /// Disable TLS certificate verification for the source registry
     /// INSECURE: accepts any certificate, including a forged one, so a
@@ -94,12 +93,12 @@ pub struct RegistryClientArgs {
     /// underlying HTTP client has no per-host toggle, so this weakens every
     /// request this build makes to the source registry. Use only for a
     /// trusted local or development registry, never in production
-    #[arg(long)]
-    pub from_skip_tls: bool,
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub from_skip_tls: Option<bool>,
 
     /// Use HTTP for registry output targets
-    #[arg(long)]
-    pub to_plain_http: bool,
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub to_plain_http: Option<bool>,
 
     /// Disable TLS certificate verification for registry output targets
     /// INSECURE: accepts any certificate, including a forged one. All `--to
@@ -107,8 +106,8 @@ pub struct RegistryClientArgs {
     /// weakens TLS for every target registry, not just the one you intend
     /// Use only for a trusted local or development registry, never in
     /// production
-    #[arg(long)]
-    pub to_skip_tls: bool,
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub to_skip_tls: Option<bool>,
 
     /// Registry read timeout in seconds [default: 60]
     #[arg(long)]
@@ -123,20 +122,16 @@ pub struct RegistryClientArgs {
     pub max_attempts: Option<usize>,
 }
 
-impl From<RegistryClientArgs> for RegistryClientSpec {
-    fn from(arguments: RegistryClientArgs) -> Self {
+impl From<&RegistryClientArgs> for RegistryOverrides {
+    fn from(arguments: &RegistryClientArgs) -> Self {
         Self {
             source_plain_http: arguments.from_plain_http,
             source_skip_tls: arguments.from_skip_tls,
             target_plain_http: arguments.to_plain_http,
             target_skip_tls: arguments.to_skip_tls,
-            connect_timeout: arguments
-                .connect_timeout
-                .map_or(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs),
-            read_timeout: arguments
-                .read_timeout
-                .map_or(DEFAULT_READ_TIMEOUT, Duration::from_secs),
-            max_attempts: arguments.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS),
+            connect_timeout: arguments.connect_timeout.map(Duration::from_secs),
+            read_timeout: arguments.read_timeout.map(Duration::from_secs),
+            max_attempts: arguments.max_attempts,
         }
     }
 }
@@ -145,18 +140,18 @@ impl From<RegistryClientArgs> for RegistryClientSpec {
 #[derive(Args)]
 pub struct CacheArgs {
     /// Cache downloaded base layers. Uses ./.rib-cache unless --cache-path is set
-    #[arg(long = "cache")]
-    pub cache: bool,
+    #[arg(long = "cache", action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub cache: Option<bool>,
 
     /// Directory for cached layers
     #[arg(long = "cache-path")]
-    pub cache_path: Option<String>,
+    pub cache_path: Option<PathBuf>,
 }
 
 impl From<CacheArgs> for CacheSpec {
     fn from(arguments: CacheArgs) -> Self {
         Self {
-            enable: arguments.cache,
+            enable: arguments.cache.unwrap_or_default(),
             cache_path: arguments.cache_path,
         }
     }
@@ -244,8 +239,8 @@ impl TryFrom<BuildArgs> for ImageBuildSpec {
             workdir: arguments.image.workdir,
             user: arguments.image.user,
             creation_time: arguments.creation_time,
-            keep_cmd: arguments.image.keep_cmd,
-            transport: arguments.client.into(),
+            keep_cmd: arguments.image.keep_cmd.unwrap_or_default(),
+            transport: RegistryOverrides::from(&arguments.client).into(),
             cache: arguments.cache.into(),
         })
     }
@@ -258,6 +253,8 @@ pub fn parse() -> Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::spec::RegistryClientSpec;
+    use crate::registry::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT};
     use std::path::Path;
 
     #[test]
@@ -283,18 +280,48 @@ mod tests {
 
     #[test]
     fn registry_client_arguments_fall_back_to_defaults() {
-        let spec: RegistryClientSpec = RegistryClientArgs {
-            from_plain_http: false,
-            from_skip_tls: false,
-            to_plain_http: false,
-            to_skip_tls: false,
+        let arguments = RegistryClientArgs {
+            from_plain_http: None,
+            from_skip_tls: None,
+            to_plain_http: None,
+            to_skip_tls: None,
             read_timeout: None,
             connect_timeout: None,
             max_attempts: Some(5),
-        }
-        .into();
+        };
+        let spec: RegistryClientSpec = RegistryOverrides::from(&arguments).into();
         assert_eq!(spec.read_timeout, DEFAULT_READ_TIMEOUT);
         assert_eq!(spec.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
         assert_eq!(spec.max_attempts, 5);
+    }
+    #[test]
+    fn boolean_flags_preserve_short_form_and_allow_explicit_false() {
+        for explicit in ["--cache", "--cache=true", "--cache=false"] {
+            let cli = Cli::try_parse_from([
+                "rib",
+                "build",
+                "--from",
+                "scratch",
+                "--to",
+                "oci-archive:image.tar",
+                explicit,
+            ])
+            .unwrap();
+            let Command::Build(args) = cli.command;
+            let spec = ImageBuildSpec::try_from(*args).unwrap();
+            assert_eq!(spec.cache.enable, explicit != "--cache=false");
+        }
+        assert!(
+            Cli::try_parse_from([
+                "rib",
+                "build",
+                "--from",
+                "scratch",
+                "--to",
+                "oci-archive:image.tar",
+                "--cache=maybe"
+            ])
+            .is_err()
+        );
     }
 }

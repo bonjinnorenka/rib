@@ -1,6 +1,3 @@
-use std::{fs::File, io::BufReader, path::Path};
-
-use anyhow::{Context, Result};
 use oci_spec::image::Digest;
 use sha2::{Digest as _, Sha256};
 
@@ -8,16 +5,6 @@ pub fn sha256_digest(bytes: &[u8]) -> Digest {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     finish_sha256(hasher)
-}
-
-pub fn sha256_digest_file(file_path: &Path) -> Result<Digest> {
-    let file = File::open(file_path)
-        .with_context(|| format!("opening file for hashing {:?}", &file_path))?;
-    let mut reader = BufReader::new(file);
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut reader, &mut hasher)
-        .with_context(|| format!("hashing file {:?}", &file_path))?;
-    Ok(finish_sha256(hasher))
 }
 
 pub fn finish_sha256(hasher: Sha256) -> Digest {
