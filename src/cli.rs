@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::app::spec::{
     CacheSpec, CopyDirective, ImageBuildSpec, RegistryOverrides, default_jobs, parse_argv,
 };
+use crate::limits::{ResourceLimits, parse_byte_size};
 use crate::output_target::OutputTarget;
 use crate::progress::ProgressMode;
 use crate::registry::NetworkPolicy;
@@ -174,6 +175,46 @@ impl RegistryClientArgs {
     }
 }
 
+/// Resource limits shared between `rib build` and `cargo rib build`
+#[derive(Args, Default)]
+pub struct ResourceLimitArgs {
+    /// Maximum size of a single downloaded registry blob (supports K/M/G/KiB/MiB/GiB)
+    #[arg(long = "max-blob-size", value_parser = parse_byte_size)]
+    pub max_blob_size: Option<u64>,
+
+    /// Maximum cumulative bytes downloaded from registries in one build
+    #[arg(long = "max-total-download", value_parser = parse_byte_size)]
+    pub max_total_download: Option<u64>,
+
+    /// Maximum decompressed size of a single base image layer
+    #[arg(long = "max-decompressed-size", value_parser = parse_byte_size)]
+    pub max_decompressed_size: Option<u64>,
+
+    /// Maximum duration in seconds for a single registry transfer operation [default: 600]
+    #[arg(long = "transfer-timeout")]
+    pub transfer_timeout: Option<u64>,
+}
+
+impl From<&ResourceLimitArgs> for ResourceLimits {
+    fn from(arguments: &ResourceLimitArgs) -> Self {
+        let defaults = Self::default();
+        Self {
+            max_blob_bytes: arguments.max_blob_size.unwrap_or(defaults.max_blob_bytes),
+            max_total_download_bytes: arguments
+                .max_total_download
+                .unwrap_or(defaults.max_total_download_bytes),
+            max_decompressed_bytes: arguments
+                .max_decompressed_size
+                .unwrap_or(defaults.max_decompressed_bytes),
+            max_manifest_bytes: defaults.max_manifest_bytes,
+            transfer_timeout: arguments
+                .transfer_timeout
+                .map(Duration::from_secs)
+                .unwrap_or(defaults.transfer_timeout),
+        }
+    }
+}
+
 /// Layer-cache arguments shared by both binaries
 #[derive(Args)]
 pub struct CacheArgs {
@@ -231,6 +272,10 @@ pub struct BuildArgs {
     #[arg(long = "copy", verbatim_doc_comment)]
     pub copies: Vec<String>,
 
+    /// Restrict COPY sources to files and directories inside these directories (repeatable)
+    #[arg(long = "copy-root")]
+    pub copy_roots: Vec<PathBuf>,
+
     /// Maximum number of COPY layers and blob transfers processed concurrently
     #[arg(long, default_value_t = default_jobs())]
     pub jobs: usize,
@@ -250,6 +295,9 @@ pub struct BuildArgs {
     pub client: RegistryClientArgs,
 
     #[command(flatten)]
+    pub limits: ResourceLimitArgs,
+
+    #[command(flatten)]
     pub cache: CacheArgs,
 }
 
@@ -264,11 +312,13 @@ impl TryFrom<BuildArgs> for ImageBuildSpec {
             .collect::<Result<_>>()?;
 
         let network_policy = arguments.client.network_policy();
+        let limits = ResourceLimits::from(&arguments.limits);
         Ok(Self {
             from: arguments.from,
             targets: arguments.targets,
             local_only: arguments.local_only.unwrap_or(false),
             copies,
+            copy_roots: arguments.copy_roots,
             jobs: arguments.jobs,
             platform: arguments.platform,
             entrypoint: arguments
@@ -286,6 +336,7 @@ impl TryFrom<BuildArgs> for ImageBuildSpec {
             keep_cmd: arguments.image.keep_cmd.unwrap_or_default(),
             transport: RegistryOverrides::from(&arguments.client).into(),
             network_policy,
+            limits,
             cache: arguments.cache.into(),
         })
     }

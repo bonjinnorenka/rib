@@ -10,7 +10,7 @@ use super::push::push_registry;
 use crate::archive::{write_docker_archive, write_oci_archive};
 use crate::auth::Credentials;
 use crate::blob::{LayerProvider, LayerStore};
-use crate::builder::layer::build_copy_layer_with_options;
+use crate::builder::layer::build_copy_layer_with_roots;
 use crate::cache::CacheController;
 use crate::digest::short_digest;
 use crate::image::Image;
@@ -19,6 +19,7 @@ use crate::image::layer::Layer;
 use crate::output_target::OutputTarget;
 use crate::progress::Progress;
 use crate::registry::{RegistryClient, RegistryOptions};
+use crate::safe_fs::CopyRoot;
 
 type ArchiveWrite = fn(
     &ImageBundle,
@@ -80,6 +81,7 @@ impl BuildRequest {
             .any(|target| matches!(target, OutputTarget::DockerArchive { .. }));
         let copies = build_copy_layers(
             self.copies,
+            Arc::new(self.copy_roots),
             self.jobs,
             retain_uncompressed,
             progress.clone(),
@@ -97,7 +99,11 @@ impl BuildRequest {
         } else {
             None
         };
-        let layer_store = Arc::new(LayerStore::new(cache_controller, self.jobs)?);
+        let layer_store = Arc::new(LayerStore::with_max_decompressed_bytes(
+            cache_controller,
+            self.jobs,
+            self.max_decompressed_bytes,
+        )?);
         if self.targets.iter().any(OutputTarget::is_archive) {
             layer_store
                 .prefetch(source_client.as_ref(), &base, &progress)
@@ -225,6 +231,7 @@ fn report_transport_options(
 
 async fn build_copy_layers(
     copies: Vec<CopyDirective>,
+    copy_roots: Arc<Vec<CopyRoot>>,
     jobs: usize,
     retain_uncompressed: bool,
     progress: Progress,
@@ -240,6 +247,7 @@ async fn build_copy_layers(
     let mut tasks = tokio::task::JoinSet::new();
     for (index, directive) in copies.into_iter().enumerate() {
         let (description, specification) = directive.into_parts();
+        let copy_roots = copy_roots.clone();
         let semaphore = semaphore.clone();
         let cancellation = cancellation.clone();
         let task = progress.spinner(format!("copy [{}/{}] {description}", index + 1, count));
@@ -250,7 +258,12 @@ async fn build_copy_layers(
                 .context("COPY worker semaphore closed")?;
             let layer = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                build_copy_layer_with_options(&specification, retain_uncompressed, cancellation)
+                build_copy_layer_with_roots(
+                    &specification,
+                    &copy_roots,
+                    retain_uncompressed,
+                    cancellation,
+                )
             })
             .await
             .with_context(|| format!("COPY worker panicked for {description:?}"))?
@@ -326,9 +339,15 @@ mod tests {
                 CopySpec::from_str(&format!("{}:/same", second.display())).unwrap(),
             ),
         ];
-        let layers = build_copy_layers(copies, 2, false, Progress::new(ProgressMode::Quiet))
-            .await
-            .unwrap();
+        let layers = build_copy_layers(
+            copies,
+            Arc::new(Vec::new()),
+            2,
+            false,
+            Progress::new(ProgressMode::Quiet),
+        )
+        .await
+        .unwrap();
         assert_eq!(layers.len(), 2);
         assert_ne!(
             layers[0].descriptor().digest(),

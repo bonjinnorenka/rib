@@ -12,9 +12,11 @@ mod cargo_integration;
 mod cli;
 mod digest;
 mod image;
+mod limits;
 mod output_target;
 mod progress;
 mod registry;
+mod safe_fs;
 mod tar_io;
 
 use anyhow::Result;

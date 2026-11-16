@@ -1,27 +1,38 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
 
-use crate::builder::copy::{CopySpec, Owner, join_posix, resolve_targets, strip_leading_slash};
+use crate::builder::copy::{
+    CopySpec, Owner, join_posix, resolve_targets_with_roots, strip_leading_slash,
+};
 use crate::builder::writers::{HashingWriter, SplitWriter};
 use crate::cancellable_io::CancellableWriter;
 use crate::image::layer::Layer;
+use crate::safe_fs::{CopyRoot, OpenedDir, OpenedSource};
 use crate::tar_io::{EntryData, write_entry};
 use anyhow::{Context, Result};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use tokio_util::sync::CancellationToken;
-use walkdir::WalkDir;
 
 #[cfg(test)]
 pub fn build_copy_layer(spec: &CopySpec) -> Result<Layer> {
-    build_copy_layer_with_options(spec, true, CancellationToken::new())
+    build_copy_layer_with_roots(spec, &[], true, CancellationToken::new())
 }
 
 /// Build a deterministic layer while optionally retaining its uncompressed tar
+#[allow(dead_code)]
 pub(crate) fn build_copy_layer_with_options(
     spec: &CopySpec,
+    retain_uncompressed: bool,
+    cancellation: CancellationToken,
+) -> Result<Layer> {
+    build_copy_layer_with_roots(spec, &[], retain_uncompressed, cancellation)
+}
+
+pub(crate) fn build_copy_layer_with_roots(
+    spec: &CopySpec,
+    copy_roots: &[CopyRoot],
     retain_uncompressed: bool,
     cancellation: CancellationToken,
 ) -> Result<Layer> {
@@ -44,7 +55,7 @@ pub(crate) fn build_copy_layer_with_options(
     let cancellable_writer = CancellableWriter::new(split_writer, cancellation, "layer build");
     let mut builder = tar::Builder::new(cancellable_writer);
 
-    write_to_tar(&mut builder, spec)?;
+    write_to_tar(&mut builder, spec, copy_roots)?;
 
     // Unwind. into_inner() calls finish() which writes tar trailer blocks
     let cancellable_writer = builder.into_inner().context("finalizing tar")?;
@@ -64,68 +75,47 @@ pub(crate) fn build_copy_layer_with_options(
     )
 }
 
-fn write_dir_entries<W: Write>(
+fn write_dir_entries_fd<W: Write>(
     builder: &mut tar::Builder<W>,
-    src_root: &Path,
+    dir: &OpenedDir,
     dst_root: &str,
     spec: &CopySpec,
     seen: &mut HashSet<String>,
 ) -> Result<()> {
-    // Sorted walk -> reproducible output regardless of filesystem order
-    let walker = WalkDir::new(src_root).sort_by_file_name();
-    for entry in walker {
-        let entry = entry.with_context(|| format!("walking {}", src_root.display()))?;
-        let rel = entry
-            .path()
-            .strip_prefix(src_root)
-            .expect("walked path is under root");
-        let dst_path = if rel.as_os_str().is_empty() {
-            dst_root.to_string()
-        } else {
-            join_posix(
-                dst_root,
-                rel.to_str().with_context(|| {
-                    format!("source path is not valid UTF-8: {}", rel.display())
-                })?,
-            )
-        };
-        let meta = entry.metadata()?;
+    let key = strip_leading_slash(dst_root)
+        .trim_end_matches('/')
+        .to_string();
+    if !key.is_empty() && seen.insert(key) {
+        write_entry(
+            builder,
+            &format!("{}/", dst_root.trim_end_matches('/')),
+            EntryData::Dir,
+            None,
+            spec.chown(),
+        )?;
+    }
 
-        if entry.file_type().is_symlink() {
-            anyhow::bail!(
-                "symlink entries are not supported yet: {}",
-                entry.path().display()
-            );
-        } else if meta.is_dir() {
-            // Dedupe — both ensure_parent_dirs and our own walk could try to
-            // write the same directory entry (e.g. dst_root itself)
-            let key = strip_leading_slash(&dst_path)
-                .trim_end_matches('/')
-                .to_string();
-            if !key.is_empty() && seen.insert(key) {
+    for name in dir.child_names_sorted()? {
+        let name_str = name.to_str().with_context(|| {
+            format!(
+                "source path is not valid UTF-8: {}",
+                std::path::Path::new(&name).display()
+            )
+        })?;
+        let dst_path = join_posix(dst_root, name_str);
+        match dir.open_child(&name)? {
+            OpenedSource::Dir(subdir) => {
+                write_dir_entries_fd(builder, &subdir, &dst_path, spec, seen)?;
+            }
+            OpenedSource::File(mut file) => {
                 write_entry(
                     builder,
-                    &format!("{}/", dst_path.trim_end_matches('/')),
-                    EntryData::Dir,
-                    None,
+                    &dst_path,
+                    EntryData::File(&mut file),
+                    spec.mode(),
                     spec.chown(),
                 )?;
             }
-        } else if meta.is_file() {
-            let mut file = std::fs::File::open(entry.path())
-                .with_context(|| format!("open {}", entry.path().display()))?;
-            write_entry(
-                builder,
-                &dst_path,
-                EntryData::File(&mut file),
-                spec.mode(),
-                spec.chown(),
-            )?;
-        } else {
-            anyhow::bail!(
-                "special file entries are not supported: {}",
-                entry.path().display()
-            );
         }
     }
     Ok(())
@@ -164,29 +154,34 @@ fn ensure_parent_dirs<W: Write>(
 }
 
 /// One concrete (src, dst-in-image) pair after globbing and dst-resolution
-/// Created from a CopySpec by `resolve_targets`
-fn write_to_tar<W: Write>(builder: &mut tar::Builder<W>, spec: &CopySpec) -> Result<()> {
-    let entries = resolve_targets(spec)?;
+/// Created from a CopySpec by `resolve_targets_with_roots`
+fn write_to_tar<W: Write>(
+    builder: &mut tar::Builder<W>,
+    spec: &CopySpec,
+    copy_roots: &[CopyRoot],
+) -> Result<()> {
+    let entries = resolve_targets_with_roots(spec, copy_roots)?;
 
     let mut dirs_written: HashSet<String> = HashSet::new();
 
-    for entry in &entries {
-        if entry.is_dir {
-            ensure_parent_dirs(builder, &entry.dst, &mut dirs_written, spec.chown())?;
-            // Directory itself is the dst — write it as a directory entry,
-            // then walk its CONTENTS into it
-            write_dir_entries(builder, &entry.src, &entry.dst, spec, &mut dirs_written)?;
-        } else {
-            ensure_parent_dirs(builder, &entry.dst, &mut dirs_written, spec.chown())?;
-            let mut file = std::fs::File::open(&entry.src)
-                .with_context(|| format!("open {}", entry.src.display()))?;
-            write_entry(
-                builder,
-                &entry.dst,
-                EntryData::File(&mut file),
-                spec.mode(),
-                spec.chown(),
-            )?;
+    for entry in entries {
+        match entry.source {
+            OpenedSource::Dir(dir) => {
+                ensure_parent_dirs(builder, &entry.dst, &mut dirs_written, spec.chown())?;
+                // Directory itself is the dst — write it as a directory entry,
+                // then walk its CONTENTS into it via pinned directory FDs
+                write_dir_entries_fd(builder, &dir, &entry.dst, spec, &mut dirs_written)?;
+            }
+            OpenedSource::File(mut file) => {
+                ensure_parent_dirs(builder, &entry.dst, &mut dirs_written, spec.chown())?;
+                write_entry(
+                    builder,
+                    &entry.dst,
+                    EntryData::File(&mut file),
+                    spec.mode(),
+                    spec.chown(),
+                )?;
+            }
         }
     }
     Ok(())
@@ -606,5 +601,168 @@ mod tests {
         eprintln!("uncompressed = {} bytes", layer.uncompressed_size());
         eprintln!("compressed   = {} bytes", layer.size());
         eprintln!("wrote /tmp/rib-smoke.tar.gz");
+    }
+
+    #[test]
+    fn copy_root_allows_files_dirs_and_globs_inside_root() {
+        let workspace = TempDir::new().unwrap();
+        let allowed = workspace.path().join("allowed");
+        std::fs::create_dir_all(allowed.join("nested")).unwrap();
+        std::fs::write(allowed.join("app.bin"), b"bin").unwrap();
+        std::fs::write(allowed.join("nested/cfg.toml"), b"cfg").unwrap();
+        let root = CopyRoot::open(&allowed).unwrap();
+
+        let file_spec = CopySpec::from_str(&format!(
+            "{}:/app/app.bin",
+            allowed.join("app.bin").display()
+        ))
+        .unwrap();
+        let layer = build_copy_layer_with_roots(
+            &file_spec,
+            std::slice::from_ref(&root),
+            true,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(paths_in_layer(&layer).contains(&"app/app.bin".to_string()));
+
+        let glob_spec = CopySpec::from_str(&format!("{}/*.bin:/app/", allowed.display())).unwrap();
+        let glob_layer = build_copy_layer_with_roots(
+            &glob_spec,
+            std::slice::from_ref(&root),
+            true,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(paths_in_layer(&glob_layer).contains(&"app/app.bin".to_string()));
+    }
+
+    #[test]
+    fn copy_root_rejects_outside_paths_and_parent_traversal() {
+        let workspace = TempDir::new().unwrap();
+        let allowed = workspace.path().join("allowed");
+        let secret = workspace.path().join("secret.txt");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::write(&secret, b"top-secret").unwrap();
+        let root = CopyRoot::open(&allowed).unwrap();
+
+        let outside_spec =
+            CopySpec::from_str(&format!("{}:/app/secret.txt", secret.display())).unwrap();
+        assert!(
+            build_copy_layer_with_roots(
+                &outside_spec,
+                std::slice::from_ref(&root),
+                false,
+                CancellationToken::new()
+            )
+            .is_err()
+        );
+
+        let traversal_spec = CopySpec::from_str(&format!(
+            "{}:/app/secret.txt",
+            allowed.join("../secret.txt").display()
+        ))
+        .unwrap();
+        assert!(
+            build_copy_layer_with_roots(
+                &traversal_spec,
+                std::slice::from_ref(&root),
+                false,
+                CancellationToken::new()
+            )
+            .is_err()
+        );
+
+        let glob_escape =
+            CopySpec::from_str(&format!("{}/../*.txt:/app/", allowed.display())).unwrap();
+        assert!(
+            build_copy_layer_with_roots(
+                &glob_escape,
+                std::slice::from_ref(&root),
+                false,
+                CancellationToken::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_root_rejects_symlink_escapes_in_parents_and_children() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TempDir::new().unwrap();
+        let allowed = workspace.path().join("allowed");
+        let outside = workspace.path().join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+
+        symlink(&outside, allowed.join("escape_dir")).unwrap();
+        symlink(outside.join("secret.txt"), allowed.join("escape_file")).unwrap();
+        let root = CopyRoot::open(&allowed).unwrap();
+
+        // Intermediate symlink component
+        let via_parent = CopySpec::from_str(&format!(
+            "{}:/app/secret.txt",
+            allowed.join("escape_dir/secret.txt").display()
+        ))
+        .unwrap();
+        assert!(
+            build_copy_layer_with_roots(
+                &via_parent,
+                std::slice::from_ref(&root),
+                false,
+                CancellationToken::new()
+            )
+            .is_err()
+        );
+
+        // Leaf symlink inside root
+        let via_leaf = CopySpec::from_str(&format!(
+            "{}:/app/secret.txt",
+            allowed.join("escape_file").display()
+        ))
+        .unwrap();
+        assert!(
+            build_copy_layer_with_roots(
+                &via_leaf,
+                std::slice::from_ref(&root),
+                false,
+                CancellationToken::new()
+            )
+            .is_err()
+        );
+
+        // Directory walk encountering symlink inside allowed root
+        let dir_walk = CopySpec::from_str(&format!("{}:/app/", allowed.display())).unwrap();
+        assert!(
+            build_copy_layer_with_roots(
+                &dir_walk,
+                std::slice::from_ref(&root),
+                false,
+                CancellationToken::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_copy_rejects_fifo_without_blocking() {
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("pipe");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // Create a named pipe (FIFO) — opening without O_NONBLOCK would hang.
+        assert_eq!(unsafe { libc_mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let spec = CopySpec::from_str(&format!("{}:/app/pipe", fifo.display())).unwrap();
+        let err = build_copy_layer(&spec).unwrap_err().to_string();
+        assert!(err.contains("special file"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    unsafe extern "C" {
+        #[link_name = "mkfifo"]
+        fn libc_mkfifo(pathname: *const std::ffi::c_char, mode: u32) -> i32;
     }
 }

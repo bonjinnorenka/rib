@@ -1621,6 +1621,7 @@ dependencies = [
  "oci-client",
  "oci-spec 0.10.0",
  "reqwest",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "secrecy",
@@ -1635,7 +1636,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "walkdir",
  "zstd",
 ]
 
