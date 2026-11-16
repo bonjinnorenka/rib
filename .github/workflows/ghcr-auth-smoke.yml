@@ -1,9 +1,6 @@
 name: GHCR authenticated push/pull smoke (Dockerless)
 
 on:
-  push:
-    branches: [ci/ghcr-auth-smoke]
-    paths: [.github/workflows/ghcr-auth-smoke.yml]
   workflow_dispatch:
 
 permissions:
@@ -12,7 +9,7 @@ permissions:
 jobs:
   ghcr:
     name: GHCR push with rib; independent skopeo pull
-    if: github.repository == 'bonjinnorenka/rib' && github.ref == 'refs/heads/ci/ghcr-auth-smoke'
+    if: github.repository == 'bonjinnorenka/rib' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
