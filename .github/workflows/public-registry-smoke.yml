@@ -1,0 +1,127 @@
+name: Public registry smoke (Dockerless)
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/public-registry-smoke.yml
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-registry-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  debian-dockerhub:
+    name: Pinned Debian pull and independent OCI verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: always
+      DEBIAN_BASE: docker.io/library/debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+    steps:
+      - name: Checkout (read-only token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.94.0
+
+      - name: Build standalone rib only
+        run: cargo build --release --locked --bin rib
+
+      - name: Anonymous public Registry pull and two Dockerless OCI builds
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test_dir="$RUNNER_TEMP/rib-public-fixture"
+          mkdir -p "$test_dir" "$RUNNER_TEMP/empty-docker-config"
+          printf '{}\n' > "$RUNNER_TEMP/empty-docker-config/config.json"
+          printf 'rib-public-registry-smoke-v1\n' > "$test_dir/payload.txt"
+          export DOCKER_CONFIG="$RUNNER_TEMP/empty-docker-config"
+          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+
+          for round in a b; do
+            ./target/release/rib build \
+              --from "$DEBIAN_BASE" \
+              --to "oci-archive:$RUNNER_TEMP/rib-debian-$round.tar@smoke" \
+              --local-only \
+              --copy-root "$test_dir" \
+              --copy "$test_dir/payload.txt:/app/payload.txt,mode=0644,chown=65532:65532" \
+              --entrypoint /bin/sh \
+              --user 65532:65532 \
+              --workdir /app \
+              --creation-time epoch \
+              --max-attempts 2 \
+              --transfer-timeout 180 \
+              --max-blob-size 256MiB \
+              --max-total-download 512MiB \
+              --max-decompressed-size 1GiB
+          done
+          sha256sum "$RUNNER_TEMP/rib-debian-a.tar" "$RUNNER_TEMP/rib-debian-b.tar"
+          cmp "$RUNNER_TEMP/rib-debian-a.tar" "$RUNNER_TEMP/rib-debian-b.tar"
+
+      - name: Verify OCI index, digest, diff_ids, and copied payload independently
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import gzip
+          import hashlib
+          import io
+          import json
+          import os
+          import tarfile
+
+          path = os.path.join(os.environ['RUNNER_TEMP'], 'rib-debian-a.tar')
+          payload = b'rib-public-registry-smoke-v1\n'
+          with tarfile.open(path, 'r:') as archive:
+              def blob(digest, expected_size=None):
+                  algorithm, value = digest.split(':', 1)
+                  assert algorithm == 'sha256', digest
+                  entry = archive.extractfile('blobs/sha256/' + value)
+                  assert entry is not None, digest
+                  data = entry.read()
+                  assert hashlib.sha256(data).hexdigest() == value, digest
+                  if expected_size is not None:
+                      assert len(data) == expected_size, digest
+                  return data
+
+              index = json.load(archive.extractfile('index.json'))
+              assert index['schemaVersion'] == 2
+              assert len(index['manifests']) == 1
+              desc = index['manifests'][0]
+              manifest = json.loads(blob(desc['digest'], desc['size']))
+              cfg_desc = manifest['config']
+              config = json.loads(blob(cfg_desc['digest'], cfg_desc['size']))
+              assert config['config']['Entrypoint'] == ['/bin/sh']
+              assert config['config']['User'] == '65532:65532'
+              assert config['config']['WorkingDir'] == '/app'
+              layers = manifest['layers']
+              diff_ids = config['rootfs']['diff_ids']
+              assert len(layers) == len(diff_ids) and len(layers) >= 2
+              for i, layer in enumerate(layers):
+                  data = blob(layer['digest'], layer['size'])
+                  media = layer['mediaType']
+                  if media.endswith('+gzip'):
+                      raw = gzip.decompress(data)
+                  elif media.endswith('.tar'):
+                      raw = data
+                  else:
+                      raise AssertionError('unsupported layer encoding: ' + media)
+                  assert 'sha256:' + hashlib.sha256(raw).hexdigest() == diff_ids[i]
+                  if i == len(layers) - 1:
+                      with tarfile.open(fileobj=io.BytesIO(raw), mode='r:') as layer_tar:
+                          items = {m.name.lstrip('./'): m for m in layer_tar.getmembers()}
+                          assert 'app/payload.txt' in items, sorted(items)
+                          member = items['app/payload.txt']
+                          assert member.isfile() and member.mode & 0o777 == 0o644
+                          assert (member.uid, member.gid) == (65532, 65532)
+                          assert layer_tar.extractfile(member).read() == payload
+              print('PASS: Docker Hub pull, OCI digests/diff_ids, config, COPY, byte reproducibility')
+          PY
