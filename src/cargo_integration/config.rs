@@ -29,6 +29,7 @@ pub(super) struct CargoRibConfig {
     pub(super) platform: Option<String>,
     pub(super) from: Option<String>,
     pub(super) to: Vec<String>,
+    pub(super) local_only: Option<bool>,
     pub(super) destination: Option<String>,
     pub(super) copies: Vec<String>,
     pub(super) entrypoint: Option<ConfigArgv>,

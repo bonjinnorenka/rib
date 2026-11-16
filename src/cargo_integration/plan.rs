@@ -107,15 +107,19 @@ pub(super) fn resolve_plan(
     };
     validate_artifact_destination(&destination)?;
 
-    let mut targets = config
-        .to
-        .iter()
-        .map(|target| parse_config_target(target, manifest_dir))
-        .collect::<Result<Vec<_>>>()?;
-    targets.extend(arguments.targets.iter().cloned());
+    let targets = if arguments.targets.is_empty() {
+        config
+            .to
+            .iter()
+            .map(|target| parse_config_target(target, manifest_dir))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        arguments.targets.clone()
+    };
     if targets.is_empty() {
         bail!("at least one output is required; set --to or package.metadata.rib.to");
     }
+    let local_only = arguments.local_only.or(config.local_only).unwrap_or(false);
 
     let mut copies = parse_copies_at(&config.copies, manifest_dir)?;
     copies.extend(parse_copies_at(&arguments.copies, current_dir)?);
@@ -156,9 +160,11 @@ pub(super) fn resolve_plan(
         cache_path: arguments.cache.cache_path.clone().or(config.cache_path),
     };
 
+    let network_policy = arguments.client.network_policy();
     let image_specification = ImageBuildSpec {
         from,
         targets,
+        local_only,
         copies,
         jobs: arguments.jobs.or(config.jobs).unwrap_or_else(default_jobs),
         platform,
@@ -179,6 +185,7 @@ pub(super) fn resolve_plan(
             .or(config.creation_time)
             .unwrap_or_else(|| "epoch".to_string()),
         transport: transport.into(),
+        network_policy,
         cache,
     };
 

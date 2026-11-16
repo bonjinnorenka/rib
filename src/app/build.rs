@@ -44,8 +44,18 @@ impl BuildRequest {
             None
         };
         let target_client =
-            RegistryClient::with_options(credentials, self.platform.clone(), self.target_registry)
-                .context("creating target registry client")?;
+            if !self.local_only && self.targets.iter().any(OutputTarget::is_registry) {
+                Some(
+                    RegistryClient::with_options(
+                        credentials,
+                        self.platform.clone(),
+                        self.target_registry,
+                    )
+                    .context("creating target registry client")?,
+                )
+            } else {
+                None
+            };
 
         let resolve_base = async {
             match (&self.source, source_client.as_ref()) {
@@ -139,9 +149,16 @@ impl BuildRequest {
                     .await?;
                 }
                 OutputTarget::Registry { reference } => {
+                    anyhow::ensure!(
+                        !self.local_only,
+                        "--local-only forbids pushing to registry {reference}"
+                    );
+                    let target_client = target_client
+                        .as_ref()
+                        .context("target registry client was not initialized")?;
                     push_registry(
                         source_client.as_ref(),
-                        &target_client,
+                        target_client,
                         &reference,
                         &bundle,
                         layer_store.clone(),

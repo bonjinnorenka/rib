@@ -18,15 +18,22 @@ pub(crate) async fn run() -> Result<()> {
     };
     let progress = Progress::new(arguments.global.progress);
     crate::app::runtime::init_tracing(&progress);
-    let credentials = Credentials::load(
-        &arguments.global.credential,
-        arguments.global.docker_config.as_deref(),
-    )?;
     let current_dir = std::env::current_dir().context("reading current directory")?;
     let cargo = cargo_executable();
     let metadata = read_metadata(&cargo, &current_dir).await?;
     let package = select_package(&metadata, &current_dir)?;
     let plan = resolve_plan(&arguments, package, &current_dir)?;
+    let credentials = if plan.image.needs_registry_access()
+        || arguments.global.docker_config.is_some()
+        || !arguments.global.credential.is_empty()
+    {
+        Credentials::load(
+            &arguments.global.credential,
+            arguments.global.docker_config.as_deref(),
+        )?
+    } else {
+        Credentials::default()
+    };
 
     run_cargo_build(&cargo, &plan, &progress).await?;
     validate_artifact(&plan.artifact)?;

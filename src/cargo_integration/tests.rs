@@ -16,6 +16,7 @@ use oci_spec::image::{
 
 use super::*;
 use crate::digest::blob_path;
+use crate::output_target::OutputTarget;
 use crate::progress::ProgressMode;
 use tempfile::TempDir;
 
@@ -347,4 +348,143 @@ fn explicit_boolean_values_override_metadata_in_both_directions() {
             assert_eq!(target.max_attempts, 2);
         }
     }
+}
+
+#[test]
+fn cli_to_replaces_configured_targets_instead_of_appending() {
+    let project = TempDir::new().unwrap();
+    let package = CargoPackage {
+        id: "demo".into(),
+        name: "demo".into(),
+        manifest_path: project.path().join("Cargo.toml"),
+        metadata: serde_json::json!({
+            "rib": {
+                "artifact": "target/release/demo",
+                "platform": "linux/amd64",
+                "from": "scratch",
+                "to": [
+                    "registry:ghcr.io/example/demo:latest",
+                    "registry:ghcr.io/example/demo:0.1.0"
+                ]
+            }
+        }),
+    };
+    let cli =
+        CargoRibCli::try_parse_from(["cargo-rib", "build", "--to", "oci-archive:dist/local.tar"])
+            .unwrap();
+    let CargoRibCommand::Build(arguments) = cli.command;
+    let plan = resolve_plan(&arguments, &package, project.path()).unwrap();
+
+    assert_eq!(
+        plan.image.targets(),
+        &[OutputTarget::OciArchive {
+            path: PathBuf::from("dist/local.tar"),
+            tag: None,
+        }]
+    );
+    assert!(!plan.image.needs_registry_access());
+}
+
+#[test]
+fn cli_multiple_to_flags_preserve_multi_output_when_replacing_config() {
+    let project = TempDir::new().unwrap();
+    let package = CargoPackage {
+        id: "demo".into(),
+        name: "demo".into(),
+        manifest_path: project.path().join("Cargo.toml"),
+        metadata: serde_json::json!({
+            "rib": {
+                "artifact": "target/release/demo",
+                "platform": "linux/amd64",
+                "from": "scratch",
+                "to": ["registry:ghcr.io/example/demo:latest"]
+            }
+        }),
+    };
+    let cli = CargoRibCli::try_parse_from([
+        "cargo-rib",
+        "build",
+        "--to",
+        "oci-archive:dist/a.tar@v1",
+        "--to",
+        "docker-archive:dist/b.tar@v1",
+    ])
+    .unwrap();
+    let CargoRibCommand::Build(arguments) = cli.command;
+    let plan = resolve_plan(&arguments, &package, project.path()).unwrap();
+
+    assert_eq!(
+        plan.image.targets(),
+        &[
+            OutputTarget::OciArchive {
+                path: PathBuf::from("dist/a.tar"),
+                tag: Some("v1".to_string()),
+            },
+            OutputTarget::DockerArchive {
+                path: PathBuf::from("dist/b.tar"),
+                tag: Some("v1".to_string()),
+            },
+        ]
+    );
+}
+
+#[test]
+fn local_only_rejects_configured_registry_target_before_execution() {
+    let project = TempDir::new().unwrap();
+    let package = CargoPackage {
+        id: "demo".into(),
+        name: "demo".into(),
+        manifest_path: project.path().join("Cargo.toml"),
+        metadata: serde_json::json!({
+            "rib": {
+                "artifact": "target/release/demo",
+                "platform": "linux/amd64",
+                "from": "scratch",
+                "to": ["registry:ghcr.io/example/demo:latest"]
+            }
+        }),
+    };
+    let cli = CargoRibCli::try_parse_from(["cargo-rib", "build", "--local-only"]).unwrap();
+    let CargoRibCommand::Build(arguments) = cli.command;
+    let error = resolve_plan(&arguments, &package, project.path())
+        .err()
+        .expect("--local-only must reject registry target")
+        .to_string();
+    assert!(error.contains("--local-only"), "got: {error}");
+    assert!(
+        error.contains("ghcr.io/example/demo:latest"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn local_only_allows_oci_archive_override_and_multiple_local_outputs() {
+    let project = TempDir::new().unwrap();
+    let package = CargoPackage {
+        id: "demo".into(),
+        name: "demo".into(),
+        manifest_path: project.path().join("Cargo.toml"),
+        metadata: serde_json::json!({
+            "rib": {
+                "artifact": "target/release/demo",
+                "platform": "linux/amd64",
+                "from": "scratch",
+                "to": ["registry:ghcr.io/example/demo:latest"]
+            }
+        }),
+    };
+    let cli = CargoRibCli::try_parse_from([
+        "cargo-rib",
+        "build",
+        "--local-only",
+        "--to",
+        "oci-archive:dist/a.tar",
+        "--to",
+        "docker-archive:dist/b.tar",
+    ])
+    .unwrap();
+    let CargoRibCommand::Build(arguments) = cli.command;
+    let plan = resolve_plan(&arguments, &package, project.path()).unwrap();
+    assert!(plan.image.local_only());
+    assert_eq!(plan.image.targets().len(), 2);
 }
