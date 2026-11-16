@@ -8,6 +8,7 @@ use crate::{
         parse_argv,
     },
     builder::copy::CopySpec,
+    limits::ResourceLimits,
     output_target::OutputTarget,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -161,11 +162,13 @@ pub(super) fn resolve_plan(
     };
 
     let network_policy = arguments.client.network_policy();
+    let limits = ResourceLimits::from(&arguments.limits);
     let image_specification = ImageBuildSpec {
         from,
         targets,
         local_only,
         copies,
+        copy_roots: arguments.copy_roots.clone(),
         jobs: arguments.jobs.or(config.jobs).unwrap_or_else(default_jobs),
         platform,
         entrypoint,
@@ -186,6 +189,7 @@ pub(super) fn resolve_plan(
             .unwrap_or_else(|| "epoch".to_string()),
         transport: transport.into(),
         network_policy,
+        limits,
         cache,
     };
 

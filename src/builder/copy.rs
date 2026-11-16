@@ -2,6 +2,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use crate::safe_fs::{
+    CopyRoot, OpenedSource, check_glob_within_copy_roots, check_within_copy_roots_lexical,
+    open_copy_source,
+};
 pub use crate::tar_io::Owner;
 
 #[derive(Debug, Clone)]
@@ -24,14 +28,14 @@ enum CopySource {
 
 #[derive(Debug)]
 pub struct ResolvedEntry {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub src: PathBuf,
+    pub source: OpenedSource,
     /// Path inside the image for this entry. Always without leading slash,
     /// always normalized. For directories, this is the root under which the
     /// directory's contents are placed (Docker semantics: contents, not the
     /// directory itself)
     pub dst: String,
-    /// True if `src` is a directory; we walk its contents
-    pub is_dir: bool,
 }
 
 impl FromStr for CopySpec {
@@ -223,9 +227,30 @@ pub fn join_posix(base: &str, suffix: &str) -> String {
     }
 }
 
-/// Expand glob, then map each matched src path to its destination in the image
+/// Pre-validate a COPY spec against `copy_roots` before files like built
+/// artifacts necessarily exist on disk.
+pub fn validate_spec_within_roots(spec: &CopySpec, copy_roots: &[CopyRoot]) -> Result<()> {
+    if copy_roots.is_empty() {
+        return Ok(());
+    }
+    match &spec.src {
+        CopySource::Path(path) => check_within_copy_roots_lexical(path, copy_roots),
+        CopySource::Glob(pattern) => check_glob_within_copy_roots(pattern, copy_roots),
+    }
+}
+
+/// Expand glob, then open and validate each matched src path without TOCTOU.
+#[cfg(test)]
 pub fn resolve_targets(spec: &CopySpec) -> Result<Vec<ResolvedEntry>> {
+    resolve_targets_with_roots(spec, &[])
+}
+
+pub fn resolve_targets_with_roots(
+    spec: &CopySpec,
+    copy_roots: &[CopyRoot],
+) -> Result<Vec<ResolvedEntry>> {
     let matches: Vec<PathBuf> = if let CopySource::Glob(pattern) = &spec.src {
+        check_glob_within_copy_roots(pattern, copy_roots)?;
         let mut v = Vec::new();
         for matched in
             glob::glob(pattern).with_context(|| format!("invalid glob pattern {:?}", spec.src))?
@@ -238,17 +263,10 @@ pub fn resolve_targets(spec: &CopySpec) -> Result<Vec<ResolvedEntry>> {
         }
         v
     } else {
-        let p = spec.source().to_path_buf();
-        if !p.exists() {
-            bail!("source does not exist: {}", p.display());
-        }
-        vec![p]
+        vec![spec.source().to_path_buf()]
     };
 
     let multiple = matches.len() > 1;
-    let any_is_dir = matches.iter().any(|p| p.is_dir());
-    let dst_is_dir = spec.destination_is_directory() || multiple || any_is_dir;
-
     if multiple && !spec.destination_is_directory() {
         // Docker: copying multiple sources requires dst to end with `/`
         // We're stricter than Docker (which would accept this if the dst
@@ -261,18 +279,19 @@ pub fn resolve_targets(spec: &CopySpec) -> Result<Vec<ResolvedEntry>> {
         );
     }
 
-    let mut out = Vec::with_capacity(matches.len());
+    let mut opened_matches = Vec::with_capacity(matches.len());
+    let mut any_is_dir = false;
     for src in matches {
-        let file_type = std::fs::symlink_metadata(&src)
-            .with_context(|| format!("stat {}", src.display()))?
-            .file_type();
-        if file_type.is_symlink() {
-            bail!("symlink sources are not supported yet: {}", src.display());
-        }
-        if !file_type.is_file() && !file_type.is_dir() {
-            bail!("special file sources are not supported: {}", src.display());
-        }
-        let is_dir = src.is_dir();
+        let source = open_copy_source(&src, copy_roots)?;
+        let is_dir = matches!(source, OpenedSource::Dir(_));
+        any_is_dir |= is_dir;
+        opened_matches.push((src, source, is_dir));
+    }
+
+    let dst_is_dir = spec.destination_is_directory() || multiple || any_is_dir;
+
+    let mut out = Vec::with_capacity(opened_matches.len());
+    for (src, source, is_dir) in opened_matches {
         let dst = if is_dir {
             normalize_image_path(strip_trailing_slash(spec.destination()))
         } else if dst_is_dir {
@@ -290,7 +309,7 @@ pub fn resolve_targets(spec: &CopySpec) -> Result<Vec<ResolvedEntry>> {
         } else {
             normalize_image_path(spec.destination())
         };
-        out.push(ResolvedEntry { src, dst, is_dir });
+        out.push(ResolvedEntry { src, source, dst });
     }
     Ok(out)
 }

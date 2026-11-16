@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cache::CacheController;
 use crate::digest::short_digest;
 use crate::image::{Image, ImageSource, layer::LayerSource};
+use crate::limits::DEFAULT_MAX_DECOMPRESSED_BYTES;
 use crate::progress::Progress;
 use crate::registry::RegistryClient;
 
@@ -39,16 +40,31 @@ pub struct LayerStore {
     cache: Option<CacheController>,
     slots: Arc<Semaphore>,
     jobs: usize,
+    max_decompressed_bytes: u64,
 }
 
 impl LayerStore {
+    #[allow(dead_code)]
     pub fn new(cache: Option<CacheController>, jobs: usize) -> Result<Self> {
+        Self::with_max_decompressed_bytes(cache, jobs, DEFAULT_MAX_DECOMPRESSED_BYTES)
+    }
+
+    pub fn with_max_decompressed_bytes(
+        cache: Option<CacheController>,
+        jobs: usize,
+        max_decompressed_bytes: u64,
+    ) -> Result<Self> {
         ensure!(jobs > 0, "layer store jobs must be greater than zero");
+        ensure!(
+            max_decompressed_bytes > 0,
+            "max decompressed bytes must be greater than zero"
+        );
         Ok(Self {
             files: Mutex::new(HashMap::new()),
             cache,
             slots: Arc::new(Semaphore::new(jobs)),
             jobs,
+            max_decompressed_bytes,
         })
     }
 
@@ -183,6 +199,7 @@ impl LayerProvider for LayerStore {
             LayerSource::FromBase { .. } => decode::decode_to_temp(
                 &mut self.blob_file(source)?,
                 source.descriptor().media_type(),
+                self.max_decompressed_bytes,
                 cancellation,
             ),
         }

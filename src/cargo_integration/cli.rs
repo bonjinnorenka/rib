@@ -1,5 +1,5 @@
 use crate::{
-    cli::{CacheArgs, GlobalArgs, ImageConfigArgs, RegistryClientArgs},
+    cli::{CacheArgs, GlobalArgs, ImageConfigArgs, RegistryClientArgs, ResourceLimitArgs},
     output_target::OutputTarget,
 };
 use clap::{Args, Parser, Subcommand};
@@ -53,6 +53,10 @@ pub(super) struct CargoRibArgs {
     #[arg(long = "copy")]
     pub(super) copies: Vec<String>,
 
+    /// Restrict COPY sources and artifact to files inside these directories (repeatable)
+    #[arg(long = "copy-root")]
+    pub(super) copy_roots: Vec<PathBuf>,
+
     #[command(flatten)]
     pub(super) image: ImageConfigArgs,
 
@@ -69,6 +73,9 @@ pub(super) struct CargoRibArgs {
 
     #[command(flatten)]
     pub(super) client: RegistryClientArgs,
+
+    #[command(flatten)]
+    pub(super) limits: ResourceLimitArgs,
 
     #[command(flatten)]
     pub(super) cache: CacheArgs,

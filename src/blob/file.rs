@@ -2,10 +2,17 @@ use anyhow::{Context, Result};
 use std::{fs::File, path::PathBuf};
 use tempfile::NamedTempFile;
 
-/// Owns temporary storage, or refers to an immutable published cache entry.
+use crate::safe_fs::reopen_verified_readonly;
+
+/// Owns temporary storage, or holds a verified read-only handle to a published cache entry.
 enum Storage {
     Temporary(NamedTempFile),
-    Cached(PathBuf),
+    Cached {
+        file: File,
+        path: PathBuf,
+        #[cfg(unix)]
+        dev_ino: (u64, u64),
+    },
 }
 
 pub struct BlobFile {
@@ -18,18 +25,34 @@ impl BlobFile {
             storage: Storage::Temporary(file),
         }
     }
-    pub(crate) fn cached(path: PathBuf) -> Self {
-        Self {
-            storage: Storage::Cached(path),
-        }
+
+    pub(crate) fn cached(file: File, path: PathBuf) -> Result<Self> {
+        #[cfg(unix)]
+        let dev_ino = crate::safe_fs::file_dev_ino(&file)?;
+        Ok(Self {
+            storage: Storage::Cached {
+                file,
+                path,
+                #[cfg(unix)]
+                dev_ino,
+            },
+        })
     }
 
     pub fn open(&self) -> Result<File> {
         match &self.storage {
             Storage::Temporary(file) => file.reopen().context("opening temporary layer"),
-            Storage::Cached(path) => {
-                File::open(path).with_context(|| format!("opening cached layer {}", path.display()))
-            }
+            Storage::Cached {
+                file,
+                path,
+                #[cfg(unix)]
+                dev_ino,
+            } => reopen_verified_readonly(
+                file,
+                path,
+                #[cfg(unix)]
+                *dev_ino,
+            ),
         }
     }
 }

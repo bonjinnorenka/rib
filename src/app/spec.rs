@@ -1,8 +1,10 @@
 use crate::{
-    builder::copy::CopySpec,
+    builder::copy::{CopySpec, validate_spec_within_roots},
     image::Platform,
+    limits::ResourceLimits,
     output_target::OutputTarget,
     registry::{NetworkPolicy, RegistryOptions, unique_hosts},
+    safe_fs::CopyRoot,
 };
 use anyhow::{Context, Result, bail};
 use oci_client::Reference;
@@ -34,7 +36,6 @@ impl CopyDirective {
         &self.description
     }
 
-    #[cfg(test)]
     pub(crate) fn specification(&self) -> &CopySpec {
         &self.specification
     }
@@ -133,6 +134,7 @@ pub(crate) struct ImageBuildSpec {
     pub(crate) targets: Vec<OutputTarget>,
     pub(crate) local_only: bool,
     pub(crate) copies: Vec<CopyDirective>,
+    pub(crate) copy_roots: Vec<PathBuf>,
     pub(crate) jobs: usize,
     pub(crate) platform: String,
     pub(crate) entrypoint: Option<Vec<String>>,
@@ -145,6 +147,7 @@ pub(crate) struct ImageBuildSpec {
     pub(crate) keep_cmd: bool,
     pub(crate) transport: RegistryClientSpec,
     pub(crate) network_policy: NetworkPolicy,
+    pub(crate) limits: ResourceLimits,
     pub(crate) cache: CacheSpec,
 }
 
@@ -160,6 +163,7 @@ pub struct BuildRequest {
     pub(super) targets: Vec<OutputTarget>,
     pub(super) local_only: bool,
     pub(super) copies: Vec<CopyDirective>,
+    pub(super) copy_roots: Vec<CopyRoot>,
     pub(super) jobs: usize,
     pub(super) platform: Platform,
     pub(super) entrypoint: Option<Vec<String>>,
@@ -172,6 +176,7 @@ pub struct BuildRequest {
     pub(super) keep_cmd: bool,
     pub(super) source_registry: RegistryOptions,
     pub(super) target_registry: RegistryOptions,
+    pub(super) max_decompressed_bytes: u64,
     pub(super) cache: CacheSpec,
 }
 
@@ -237,6 +242,15 @@ impl TryFrom<ImageBuildSpec> for BuildRequest {
             bail!("at least one output target is required");
         }
         specification.network_policy.validate()?;
+        specification.limits.validate()?;
+        let copy_roots = specification
+            .copy_roots
+            .iter()
+            .map(|root| CopyRoot::open(root))
+            .collect::<Result<Vec<_>>>()?;
+        for directive in &specification.copies {
+            validate_spec_within_roots(directive.specification(), &copy_roots)?;
+        }
         if specification.local_only {
             let disallowed: Vec<String> = specification
                 .targets
@@ -298,6 +312,7 @@ impl TryFrom<ImageBuildSpec> for BuildRequest {
             &specification.targets,
             specification.transport,
             &specification.network_policy,
+            specification.limits,
         );
 
         Ok(Self {
@@ -305,6 +320,7 @@ impl TryFrom<ImageBuildSpec> for BuildRequest {
             targets: specification.targets,
             local_only: specification.local_only,
             copies: specification.copies,
+            copy_roots,
             jobs: specification.jobs,
             platform: Platform::from_str(&specification.platform)?,
             entrypoint: specification.entrypoint,
@@ -317,6 +333,7 @@ impl TryFrom<ImageBuildSpec> for BuildRequest {
             keep_cmd: specification.keep_cmd,
             source_registry,
             target_registry,
+            max_decompressed_bytes: specification.limits.max_decompressed_bytes,
             cache: specification.cache,
         })
     }
@@ -327,6 +344,7 @@ fn registry_options(
     targets: &[OutputTarget],
     transport: RegistryClientSpec,
     network_policy: &NetworkPolicy,
+    limits: ResourceLimits,
 ) -> (RegistryOptions, RegistryOptions) {
     let source_hosts: Vec<String> = source
         .map(|s| s.resolve_registry().to_string())
@@ -344,6 +362,7 @@ fn registry_options(
         read_timeout: transport.read_timeout,
         max_attempts: transport.max_attempts,
         network_policy: network_policy.clone(),
+        limits,
     };
     let all_target_hosts = unique_hosts(targets.iter().filter_map(|target| match target {
         OutputTarget::Registry { reference } => Some(reference.resolve_registry().to_string()),
@@ -362,6 +381,7 @@ fn registry_options(
         read_timeout: transport.read_timeout,
         max_attempts: transport.max_attempts,
         network_policy: network_policy.clone(),
+        limits,
     };
     (source, target)
 }
@@ -406,6 +426,7 @@ mod tests {
             targets: vec![target.clone()],
             local_only: false,
             copies: Vec::new(),
+            copy_roots: Vec::new(),
             jobs: 1,
             platform: "linux/amd64".to_string(),
             entrypoint: None,
@@ -418,6 +439,7 @@ mod tests {
             keep_cmd: false,
             transport,
             network_policy: NetworkPolicy::default(),
+            limits: ResourceLimits::default(),
             cache: CacheSpec::default(),
         };
 
@@ -484,6 +506,7 @@ mod tests {
                 max_attempts: 3,
             },
             &NetworkPolicy::default(),
+            ResourceLimits::default(),
         );
 
         assert_eq!(source_options.plain_http_hosts, vec!["source.test"]);
@@ -500,6 +523,7 @@ mod tests {
             &[],
             RegistryClientSpec::default(),
             &NetworkPolicy::default(),
+            ResourceLimits::default(),
         );
         assert!(source_options.plain_http_hosts.is_empty());
         assert!(!source_options.skip_tls_verify);
@@ -515,6 +539,7 @@ mod tests {
             targets: vec![target.clone()],
             local_only: false,
             copies: Vec::new(),
+            copy_roots: Vec::new(),
             jobs: 1,
             platform: "linux/amd64".to_string(),
             entrypoint: None,
@@ -527,6 +552,7 @@ mod tests {
             keep_cmd: false,
             transport: RegistryClientSpec::default(),
             network_policy: NetworkPolicy::default(),
+            limits: ResourceLimits::default(),
             cache: CacheSpec {
                 enable: false,
                 cache_path: None,
@@ -558,6 +584,7 @@ mod tests {
                 ..RegistryClientSpec::default()
             },
             &NetworkPolicy::default(),
+            ResourceLimits::default(),
         );
 
         assert!(source_options.plain_http_hosts.is_empty());
@@ -575,6 +602,7 @@ mod tests {
             ],
             local_only: true,
             copies: Vec::new(),
+            copy_roots: Vec::new(),
             jobs: 1,
             platform: "linux/amd64".to_string(),
             entrypoint: None,
@@ -587,6 +615,7 @@ mod tests {
             keep_cmd: false,
             transport: RegistryClientSpec::default(),
             network_policy: NetworkPolicy::default(),
+            limits: ResourceLimits::default(),
             cache: CacheSpec::default(),
         };
         let error = BuildRequest::try_from(spec)
@@ -600,6 +629,7 @@ mod tests {
             targets: vec!["oci-archive:out.tar".parse::<OutputTarget>().unwrap()],
             local_only: true,
             copies: Vec::new(),
+            copy_roots: Vec::new(),
             jobs: 1,
             platform: "linux/amd64".to_string(),
             entrypoint: None,
@@ -615,6 +645,7 @@ mod tests {
                 allowed_registries: vec!["ghcr.io".to_string()],
                 ..NetworkPolicy::default()
             },
+            limits: ResourceLimits::default(),
             cache: CacheSpec::default(),
         };
         let error = BuildRequest::try_from(spec)

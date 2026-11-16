@@ -33,6 +33,7 @@ use sha2::{Digest as _, Sha256};
 use crate::auth::{Credential, Credentials};
 use crate::digest::{finish_sha256, sha256_digest};
 use crate::image::{Image, ImageSource, Platform};
+use crate::limits::{DownloadBudget, ResourceLimits};
 
 const UPLOAD_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
@@ -54,6 +55,7 @@ pub struct RegistryOptions {
     pub read_timeout: Duration,
     pub max_attempts: usize,
     pub network_policy: NetworkPolicy,
+    pub limits: ResourceLimits,
 }
 
 impl Default for RegistryOptions {
@@ -66,6 +68,7 @@ impl Default for RegistryOptions {
             read_timeout: DEFAULT_READ_TIMEOUT,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             network_policy: NetworkPolicy::default(),
+            limits: ResourceLimits::default(),
         }
     }
 }
@@ -96,6 +99,7 @@ pub struct RegistryClient {
     blob_http: reqwest::Client,
     proxy: Arc<ValidatingProxy>,
     repo_clients: Arc<tokio::sync::Mutex<HashMap<RepoClientKey, (Client, RegistryAuth)>>>,
+    download_budget: DownloadBudget,
     options: RegistryOptions,
     credentials: Arc<Credentials>,
     platform: Platform,
@@ -114,6 +118,7 @@ impl RegistryClient {
         options: RegistryOptions,
     ) -> Result<Self> {
         options.network_policy.validate()?;
+        options.limits.validate()?;
         let tokens =
             token::TokenClient::new(&options).context("creating registry token HTTP client")?;
         let resolver = Arc::new(PolicyDnsResolver::new(
@@ -143,11 +148,13 @@ impl RegistryClient {
             )
             .context("starting registry validating proxy")?,
         );
+        let download_budget = DownloadBudget::new(options.limits.max_total_download_bytes);
         Ok(Self {
             tokens,
             blob_http,
             proxy,
             repo_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            download_budget,
             credentials: Arc::new(credentials),
             platform,
             retry_policy: RetryPolicy {
@@ -218,15 +225,27 @@ impl RegistryClient {
     /// Pull base image: resolve manifest list -> platform manifest -> config
     /// Layer bytes are not fetched
     pub async fn pull_base(&self, reference: &Reference) -> Result<Image> {
+        let transfer_timeout = self.options.limits.transfer_timeout;
         let (manifest, manifest_digest, config_json) =
             retry_registry("pull manifest and config", self.retry_policy, || async {
-                let (client, auth) = self.client_for_repo(reference, false).await?;
-                client.pull_manifest_and_config(reference, &auth).await
+                with_transfer_timeout(transfer_timeout, "pulling manifest and config", async {
+                    let (client, auth) = self.client_for_repo(reference, false).await?;
+                    client.pull_manifest_and_config(reference, &auth).await
+                })
+                .await
             })
             .await
             .with_context(|| format!("pulling manifest+config for {reference}"))?;
 
         let config_bytes = config_json.into_bytes();
+        if config_bytes.len() as u64 > self.options.limits.max_manifest_bytes {
+            bail!(
+                "image config size ({} bytes) exceeds limit of {} bytes",
+                config_bytes.len(),
+                self.options.limits.max_manifest_bytes
+            );
+        }
+        self.download_budget.reserve(config_bytes.len() as u64)?;
         let config: ImageConfiguration =
             serde_json::from_slice(&config_bytes).context("parsing image config JSON")?;
         let computed = sha256_digest(&config_bytes);
@@ -290,6 +309,14 @@ impl RegistryClient {
     where
         F: Fn(u64) + Send + Sync,
     {
+        if descriptor.size() > self.options.limits.max_blob_bytes {
+            bail!(
+                "blob {} size ({} bytes) exceeds --max-blob-size limit of {} bytes",
+                descriptor.digest(),
+                descriptor.size(),
+                self.options.limits.max_blob_bytes
+            );
+        }
         // Strip unvalidated external descriptor URLs before passing to oci-client;
         // allowed external URLs are handled below through our policy-enforced HTTP client.
         let oc = OciDescriptor {
@@ -309,14 +336,19 @@ impl RegistryClient {
         let destination = file.try_clone().context("cloning download file")?;
         let on_progress = Arc::new(on_progress);
         let reported_bytes = AtomicU64::new(0);
+        let transfer_timeout = self.options.limits.transfer_timeout;
         retry_registry("pull blob", self.retry_policy, || {
-            self.fetch_layer_once(
-                &destination,
-                reference,
-                &oc,
-                &fallback_urls,
-                on_progress.as_ref(),
-                &reported_bytes,
+            with_transfer_timeout(
+                transfer_timeout,
+                "pulling layer blob",
+                self.fetch_layer_once(
+                    &destination,
+                    reference,
+                    &oc,
+                    &fallback_urls,
+                    on_progress.as_ref(),
+                    &reported_bytes,
+                ),
             )
         })
         .await
@@ -339,27 +371,53 @@ impl RegistryClient {
         let mut writer = tokio::fs::File::from_std(file.try_clone()?);
         writer.set_len(0).await?;
         writer.seek(SeekFrom::Start(0)).await?;
+        let expected_size = u64::try_from(descriptor.size).map_err(|_| {
+            OciDistributionError::SpecViolationError(format!(
+                "invalid negative descriptor size: {}",
+                descriptor.size
+            ))
+        })?;
+        let max_blob_bytes = self.options.limits.max_blob_bytes;
+        if expected_size > max_blob_bytes {
+            return Err(OciDistributionError::SpecViolationError(format!(
+                "blob size ({expected_size} bytes) exceeds limit of {max_blob_bytes} bytes"
+            )));
+        }
+
         let (client, _) = self.client_for_repo(reference, false).await?;
         let stream_result = client.pull_blob_stream(reference, descriptor).await;
         match stream_result {
             Ok(mut stream) => {
+                if let Some(content_len) = stream.content_length
+                    && (content_len > expected_size || content_len > max_blob_bytes)
+                {
+                    return Err(OciDistributionError::SpecViolationError(format!(
+                        "blob Content-Length ({content_len} bytes) exceeds allowed limit (expected {expected_size}, max {max_blob_bytes})"
+                    )));
+                }
                 let mut attempt_bytes = 0_u64;
                 let mut hasher = Sha256::new();
 
                 while let Some(chunk) = stream.try_next().await? {
-                    hasher.update(&chunk);
-                    writer.write_all(&chunk).await?;
-                    attempt_bytes += chunk.len() as u64;
-                    report_progress_high_det(reported_bytes, attempt_bytes, on_progress);
+                    self.write_bounded_chunk(
+                        &mut writer,
+                        &mut hasher,
+                        &chunk,
+                        &mut attempt_bytes,
+                        expected_size,
+                        max_blob_bytes,
+                        on_progress,
+                        reported_bytes,
+                    )
+                    .await?;
                 }
 
                 writer.flush().await?;
                 writer.sync_all().await?;
                 verify_layer_digest(&descriptor.digest, hasher)?;
-                if attempt_bytes != descriptor.size as u64 {
+                if attempt_bytes != expected_size {
                     return Err(OciDistributionError::SpecViolationError(format!(
-                        "blob size mismatch: expected {}, received {attempt_bytes}",
-                        descriptor.size
+                        "blob size mismatch: expected {expected_size}, received {attempt_bytes}"
                     )));
                 }
                 Ok(())
@@ -373,6 +431,8 @@ impl RegistryClient {
                 self.fetch_from_external_urls(
                     &mut writer,
                     descriptor,
+                    expected_size,
+                    max_blob_bytes,
                     fallback_urls,
                     on_progress,
                     reported_bytes,
@@ -383,10 +443,53 @@ impl RegistryClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn write_bounded_chunk<F>(
+        &self,
+        writer: &mut tokio::fs::File,
+        hasher: &mut Sha256,
+        chunk: &[u8],
+        attempt_bytes: &mut u64,
+        expected_size: u64,
+        max_blob_bytes: u64,
+        on_progress: &F,
+        reported_bytes: &AtomicU64,
+    ) -> oci_client::errors::Result<()>
+    where
+        F: Fn(u64) + Sync + ?Sized,
+    {
+        let chunk_len = chunk.len() as u64;
+        let next_bytes = attempt_bytes.checked_add(chunk_len).ok_or_else(|| {
+            OciDistributionError::SpecViolationError("blob byte counter overflow".into())
+        })?;
+        if next_bytes > expected_size {
+            return Err(OciDistributionError::SpecViolationError(format!(
+                "blob stream exceeded declared size {expected_size} bytes (received at least {next_bytes} bytes)"
+            )));
+        }
+        if next_bytes > max_blob_bytes {
+            return Err(OciDistributionError::SpecViolationError(format!(
+                "blob stream exceeded --max-blob-size limit of {max_blob_bytes} bytes"
+            )));
+        }
+        self.download_budget
+            .reserve(chunk_len)
+            .map_err(|error| OciDistributionError::SpecViolationError(error.to_string()))?;
+
+        hasher.update(chunk);
+        writer.write_all(chunk).await?;
+        *attempt_bytes = next_bytes;
+        report_progress_high_det(reported_bytes, *attempt_bytes, on_progress);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_from_external_urls<F>(
         &self,
         writer: &mut tokio::fs::File,
         descriptor: &OciDescriptor,
+        expected_size: u64,
+        max_blob_bytes: u64,
         fallback_urls: &[String],
         on_progress: &F,
         reported_bytes: &AtomicU64,
@@ -465,24 +568,37 @@ impl RegistryClient {
                 };
                 continue;
             }
+            if let Some(content_len) = response.content_length()
+                && (content_len > expected_size || content_len > max_blob_bytes)
+            {
+                return Err(OciDistributionError::SpecViolationError(format!(
+                    "external blob Content-Length ({content_len} bytes) exceeds allowed limit (expected {expected_size}, max {max_blob_bytes})"
+                )));
+            }
 
             writer.set_len(0).await?;
             writer.seek(SeekFrom::Start(0)).await?;
             let mut attempt_bytes = 0_u64;
             let mut hasher = Sha256::new();
             while let Some(chunk) = response.chunk().await? {
-                hasher.update(&chunk);
-                writer.write_all(&chunk).await?;
-                attempt_bytes += chunk.len() as u64;
-                report_progress_high_det(reported_bytes, attempt_bytes, on_progress);
+                self.write_bounded_chunk(
+                    writer,
+                    &mut hasher,
+                    &chunk,
+                    &mut attempt_bytes,
+                    expected_size,
+                    max_blob_bytes,
+                    on_progress,
+                    reported_bytes,
+                )
+                .await?;
             }
             writer.flush().await?;
             writer.sync_all().await?;
             verify_layer_digest(&descriptor.digest, hasher)?;
-            if attempt_bytes != descriptor.size as u64 {
+            if attempt_bytes != expected_size {
                 return Err(OciDistributionError::SpecViolationError(format!(
-                    "blob size mismatch: expected {}, received {attempt_bytes}",
-                    descriptor.size
+                    "blob size mismatch: expected {expected_size}, received {attempt_bytes}"
                 )));
             }
             return Ok(());
@@ -627,6 +743,25 @@ impl RegistryClient {
         .with_context(|| format!("pushing manifest to {reference}"))?;
         Ok(())
     }
+}
+
+async fn with_transfer_timeout<T, Fut>(
+    duration: Duration,
+    operation: &str,
+    fut: Fut,
+) -> oci_client::errors::Result<T>
+where
+    Fut: std::future::Future<Output = oci_client::errors::Result<T>>,
+{
+    tokio::time::timeout(duration, fut).await.map_err(|_| {
+        OciDistributionError::IoError(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "{operation} exceeded transfer timeout of {}s",
+                duration.as_secs()
+            ),
+        ))
+    })?
 }
 
 fn verify_layer_digest(expected: &str, hasher: Sha256) -> oci_client::errors::Result<()> {
@@ -2057,6 +2192,531 @@ seTuix+/DtzfmDHobU29\n\
                 msg.contains("403") || msg.contains("forbidden") || msg.contains("blocked"),
                 "expected proxy block for {redirect_url} redirect, got: {msg}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_download_aborts_during_stream_when_exceeding_declared_size() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = task_shutdown.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else { break; };
+                        tokio::spawn(async move {
+                            let mut reader = BufReader::new(&mut stream);
+                            let mut line = String::new();
+                            loop {
+                                line.clear();
+                                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                    return;
+                                }
+                                if line.trim_end_matches(&['\r', '\n'][..]).is_empty() {
+                                    break;
+                                }
+                            }
+                            let inner = reader.into_inner();
+                            // Chunked response with 1024 bytes when descriptor declares 64 bytes.
+                            let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n400\r\n";
+                            let _ = inner.write_all(head.as_bytes()).await;
+                            let _ = inner.write_all(&vec![b'A'; 1024]).await;
+                            let _ = inner.write_all(b"\r\n0\r\n\r\n").await;
+                            let _ = inner.shutdown().await;
+                        });
+                    }
+                }
+            }
+        });
+
+        let registry = format!("127.0.0.1:{port}");
+        let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+        let expected_digest = sha256_digest(&[b'A'; 64]);
+        let descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageLayer)
+            .digest(expected_digest)
+            .size(64_u64)
+            .build()
+            .unwrap();
+        let client = RegistryClient::with_options(
+            Credentials::default(),
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                plain_http_hosts: vec![registry.clone()],
+                registry_hosts: vec![registry],
+                max_attempts: 2,
+                network_policy: NetworkPolicy {
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+
+        let mut tmp = tempfile::tempfile().unwrap();
+        let err = client
+            .fetch_layer_to_file(&reference, &descriptor, &mut tmp, |_| {})
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("exceeded declared size"), "got: {msg}");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn blob_size_limit_aborts_build_without_publishing_cache_or_archive() {
+        use crate::app::spec::{BuildRequest, CacheSpec, ImageBuildSpec, RegistryClientSpec};
+        use crate::output_target::OutputTarget;
+        use crate::progress::{Progress, ProgressMode};
+
+        let layer_bytes = vec![b'X'; 512];
+        let layer_digest = sha256_digest(&layer_bytes).to_string();
+        let config_json = format!(
+            r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":["{layer_digest}"]}}}}"#
+        );
+        let config_digest = sha256_digest(config_json.as_bytes()).to_string();
+        let manifest_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_digest}","size":{}}}]}}"#,
+            config_json.len(),
+            layer_bytes.len()
+        );
+        let manifest_digest = sha256_digest(manifest_json.as_bytes()).to_string();
+
+        let server = spawn_mock_server(false, move |req| match req.path.as_str() {
+            "/v2/" => MockHttpResponse::json(200, "{}"),
+            "/v2/test/app/manifests/v1" => MockHttpResponse {
+                status: 200,
+                headers: vec![
+                    (
+                        "Content-Type".into(),
+                        "application/vnd.oci.image.manifest.v1+json".into(),
+                    ),
+                    ("Docker-Content-Digest".into(), manifest_digest.clone()),
+                ],
+                body: manifest_json.as_bytes().to_vec(),
+            },
+            p if p == format!("/v2/test/app/blobs/{config_digest}") => {
+                MockHttpResponse::bytes(200, "application/json", config_json.as_bytes().to_vec())
+            }
+            p if p == format!("/v2/test/app/blobs/{layer_digest}") => {
+                MockHttpResponse::bytes(200, "application/octet-stream", layer_bytes.clone())
+            }
+            _ => MockHttpResponse::json(404, "{}"),
+        })
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let archive_path = dir.path().join("out.tar");
+        let spec = ImageBuildSpec {
+            from: format!("127.0.0.1:{}/test/app:v1", server.port),
+            targets: vec![OutputTarget::OciArchive {
+                path: archive_path.clone(),
+                tag: None,
+            }],
+            local_only: true,
+            copies: Vec::new(),
+            copy_roots: Vec::new(),
+            jobs: 1,
+            platform: "linux/amd64".to_string(),
+            entrypoint: None,
+            cmd: None,
+            labels: Vec::new(),
+            ports: Vec::new(),
+            workdir: None,
+            user: None,
+            creation_time: "epoch".to_string(),
+            keep_cmd: false,
+            transport: RegistryClientSpec {
+                source_plain_http: true,
+                ..RegistryClientSpec::default()
+            },
+            network_policy: NetworkPolicy {
+                allow_private_network: true,
+                ..NetworkPolicy::default()
+            },
+            limits: ResourceLimits {
+                max_blob_bytes: 128,
+                ..ResourceLimits::default()
+            },
+            cache: CacheSpec {
+                enable: true,
+                cache_path: Some(cache_dir.clone()),
+            },
+        };
+
+        let request = BuildRequest::try_from(spec).unwrap();
+        let err = request
+            .run(Credentials::default(), Progress::new(ProgressMode::Quiet))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("--max-blob-size"));
+        assert!(!archive_path.exists(), "incomplete archive must not exist");
+        let cache_entries: Vec<_> = std::fs::read_dir(&cache_dir).unwrap().collect();
+        assert!(
+            cache_entries.is_empty(),
+            "failed blob must not be published to cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn cumulative_total_download_limit_is_enforced_across_layers() {
+        let layer1 = vec![1_u8; 128];
+        let layer2 = vec![2_u8; 128];
+        let d1 = sha256_digest(&layer1);
+        let d2 = sha256_digest(&layer2);
+        let p1 = format!("/v2/test/app/blobs/{d1}");
+        let p2 = format!("/v2/test/app/blobs/{d2}");
+        let server = spawn_mock_server(false, move |req| {
+            if req.path == "/v2/" {
+                MockHttpResponse::json(200, "{}")
+            } else if req.path == p1 {
+                MockHttpResponse::bytes(200, "application/octet-stream", layer1.clone())
+            } else if req.path == p2 {
+                MockHttpResponse::bytes(200, "application/octet-stream", layer2.clone())
+            } else {
+                MockHttpResponse::json(404, "{}")
+            }
+        })
+        .await;
+
+        let registry = format!("127.0.0.1:{}", server.port);
+        let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+        let client = RegistryClient::with_options(
+            Credentials::default(),
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                plain_http_hosts: vec![registry.clone()],
+                registry_hosts: vec![registry],
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                limits: ResourceLimits {
+                    max_total_download_bytes: 200,
+                    ..ResourceLimits::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+
+        let desc1 = DescriptorBuilder::default()
+            .media_type(MediaType::ImageLayer)
+            .digest(d1)
+            .size(128_u64)
+            .build()
+            .unwrap();
+        let desc2 = DescriptorBuilder::default()
+            .media_type(MediaType::ImageLayer)
+            .digest(d2)
+            .size(128_u64)
+            .build()
+            .unwrap();
+
+        let mut f1 = tempfile::tempfile().unwrap();
+        client
+            .fetch_layer_to_file(&reference, &desc1, &mut f1, |_| {})
+            .await
+            .unwrap();
+        let mut f2 = tempfile::tempfile().unwrap();
+        let err = client
+            .fetch_layer_to_file(&reference, &desc2, &mut f2, |_| {})
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("total registry download size exceeds"));
+    }
+
+    #[tokio::test]
+    async fn slowloris_registry_is_aborted_by_transfer_timeout() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = task_shutdown.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else { break; };
+                        tokio::spawn(async move {
+                            let mut reader = BufReader::new(&mut stream);
+                            let mut line = String::new();
+                            loop {
+                                line.clear();
+                                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                    return;
+                                }
+                                if line.trim_end_matches(&['\r', '\n'][..]).is_empty() {
+                                    break;
+                                }
+                            }
+                            let inner = reader.into_inner();
+                            let _ = inner
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\npartial")
+                                .await;
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        });
+                    }
+                }
+            }
+        });
+
+        let registry = format!("127.0.0.1:{port}");
+        let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+        let descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageLayer)
+            .digest(sha256_digest(&[0_u8; 500]))
+            .size(500_u64)
+            .build()
+            .unwrap();
+        let client = RegistryClient::with_options(
+            Credentials::default(),
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                plain_http_hosts: vec![registry.clone()],
+                registry_hosts: vec![registry],
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                limits: ResourceLimits {
+                    transfer_timeout: Duration::from_millis(150),
+                    ..ResourceLimits::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+
+        let mut tmp = tempfile::tempfile().unwrap();
+        let err = client
+            .fetch_layer_to_file(&reference, &descriptor, &mut tmp, |_| {})
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("transfer timeout"));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn end_to_end_tls_base_multi_copy_and_reproducibility() {
+        use crate::app::spec::{
+            BuildRequest, CacheSpec, CopyDirective, ImageBuildSpec, RegistryClientSpec,
+        };
+        use crate::output_target::OutputTarget;
+        use crate::progress::{Progress, ProgressMode};
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use oci_spec::image::{ImageConfiguration, ImageIndex, ImageManifest};
+        use std::io::{Read, Write};
+
+        // Build a valid gzip-compressed tar base layer with distinct diff_id and digest.
+        let mut base_tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut base_tar);
+            let mut header = tar::Header::new_gnu();
+            let content = b"debian-like-base-release\n";
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "etc/os-release", &content[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let base_diff_id = sha256_digest(&base_tar).to_string();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&base_tar).unwrap();
+        let base_gz = encoder.finish().unwrap();
+        let base_digest = sha256_digest(&base_gz).to_string();
+
+        let config_json = format!(
+            r#"{{"architecture":"amd64","os":"linux","config":{{"Cmd":["/bin/sh"]}},"rootfs":{{"type":"layers","diff_ids":["{base_diff_id}"]}}}}"#
+        );
+        let config_digest = sha256_digest(config_json.as_bytes()).to_string();
+        let manifest_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{base_digest}","size":{}}}]}}"#,
+            config_json.len(),
+            base_gz.len()
+        );
+        let manifest_digest = sha256_digest(manifest_json.as_bytes()).to_string();
+
+        let port_holder = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let port_ref = port_holder.clone();
+        let server = spawn_mock_server(true, move |req| {
+            let port = port_ref.load(Ordering::Relaxed);
+            match req.path.as_str() {
+                "/v2/" => {
+                    if !req.headers.contains_key("authorization") {
+                        MockHttpResponse {
+                            status: 401,
+                            headers: vec![(
+                                "WWW-Authenticate".into(),
+                                format!(
+                                    r#"Bearer realm="https://127.0.0.1:{port}/token",service="reg""#
+                                ),
+                            )],
+                            body: Vec::new(),
+                        }
+                    } else {
+                        MockHttpResponse::json(200, "{}")
+                    }
+                }
+                p if p.starts_with("/token") => MockHttpResponse::json(200, r#"{"token":"ok"}"#),
+                "/v2/library/debian/manifests/bookworm" => MockHttpResponse {
+                    status: 200,
+                    headers: vec![
+                        (
+                            "Content-Type".into(),
+                            "application/vnd.oci.image.manifest.v1+json".into(),
+                        ),
+                        ("Docker-Content-Digest".into(), manifest_digest.clone()),
+                    ],
+                    body: manifest_json.as_bytes().to_vec(),
+                },
+                p if p == format!("/v2/library/debian/blobs/{config_digest}") => {
+                    MockHttpResponse::bytes(
+                        200,
+                        "application/json",
+                        config_json.as_bytes().to_vec(),
+                    )
+                }
+                p if p == format!("/v2/library/debian/blobs/{base_digest}") => {
+                    MockHttpResponse::bytes(200, "application/octet-stream", base_gz.clone())
+                }
+                _ => MockHttpResponse::json(404, "{}"),
+            }
+        })
+        .await;
+        port_holder.store(server.port, Ordering::Relaxed);
+
+        let workspace = tempfile::tempdir().unwrap();
+        let inputs = workspace.path().join("inputs");
+        std::fs::create_dir_all(inputs.join("data/nested")).unwrap();
+        std::fs::write(inputs.join("probe"), b"#!/bin/sh\necho ok\n").unwrap();
+        std::fs::write(inputs.join("settings.conf"), b"mode=ci\n").unwrap();
+        std::fs::write(inputs.join("data/top.txt"), b"top\n").unwrap();
+        std::fs::write(inputs.join("data/nested/sub.txt"), b"sub\n").unwrap();
+
+        let out_a = workspace.path().join("out-a.tar");
+        let out_b = workspace.path().join("out-b.tar");
+        let cache_dir = workspace.path().join("cache");
+        let registry = format!("127.0.0.1:{}", server.port);
+        let creds = Credentials::load(&[format!("{registry}=ci:pass")], None).unwrap();
+
+        let build_once = |out: std::path::PathBuf| {
+            let spec = ImageBuildSpec {
+                from: format!("{registry}/library/debian:bookworm"),
+                targets: vec![OutputTarget::OciArchive {
+                    path: out,
+                    tag: Some("ci".to_string()),
+                }],
+                local_only: true,
+                copies: vec![
+                    CopyDirective::parse(format!(
+                        "{}:/app/probe,mode=0755,chown=65532:65532",
+                        inputs.join("probe").display()
+                    ))
+                    .unwrap(),
+                    CopyDirective::parse(format!(
+                        "{}:/app/config/settings.conf,mode=0640,chown=65532:65532",
+                        inputs.join("settings.conf").display()
+                    ))
+                    .unwrap(),
+                    CopyDirective::parse(format!(
+                        "{}:/app/data/,chown=65532:65532",
+                        inputs.join("data").display()
+                    ))
+                    .unwrap(),
+                ],
+                copy_roots: vec![inputs.clone()],
+                jobs: 2,
+                platform: "linux/amd64".to_string(),
+                entrypoint: Some(vec!["/app/probe".to_string()]),
+                cmd: None,
+                labels: vec!["org.test.ci=true".to_string()],
+                ports: Vec::new(),
+                workdir: Some("/app".to_string()),
+                user: Some("65532:65532".to_string()),
+                creation_time: "epoch".to_string(),
+                keep_cmd: false,
+                transport: RegistryClientSpec {
+                    source_skip_tls: true,
+                    ..RegistryClientSpec::default()
+                },
+                network_policy: NetworkPolicy {
+                    allowed_registries: vec![registry.clone()],
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                limits: ResourceLimits::default(),
+                cache: CacheSpec {
+                    enable: true,
+                    cache_path: Some(cache_dir.clone()),
+                },
+            };
+            BuildRequest::try_from(spec).unwrap()
+        };
+
+        build_once(out_a.clone())
+            .run(creds.clone(), Progress::new(ProgressMode::Quiet))
+            .await
+            .unwrap();
+        build_once(out_b.clone())
+            .run(creds, Progress::new(ProgressMode::Quiet))
+            .await
+            .unwrap();
+
+        let bytes_a = std::fs::read(&out_a).unwrap();
+        let bytes_b = std::fs::read(&out_b).unwrap();
+        assert_eq!(
+            sha256_digest(&bytes_a),
+            sha256_digest(&bytes_b),
+            "OCI archive across cache miss + cache hit must be byte-reproducible"
+        );
+
+        let read_entry = |name: &str| -> Vec<u8> {
+            let mut archive = tar::Archive::new(bytes_a.as_slice());
+            for entry in archive.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                if entry.path().unwrap().to_string_lossy() == name {
+                    let mut buf = Vec::new();
+                    entry.read_to_end(&mut buf).unwrap();
+                    return buf;
+                }
+            }
+            panic!("missing archive entry {name}");
+        };
+
+        let index: ImageIndex = serde_json::from_slice(&read_entry("index.json")).unwrap();
+        let manifest_desc = &index.manifests()[0];
+        let manifest_bytes = read_entry(&crate::digest::blob_path(manifest_desc.digest()));
+        assert_eq!(sha256_digest(&manifest_bytes), *manifest_desc.digest());
+        let manifest: ImageManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert_eq!(manifest.layers().len(), 4);
+
+        let config_bytes = read_entry(&crate::digest::blob_path(manifest.config().digest()));
+        assert_eq!(sha256_digest(&config_bytes), *manifest.config().digest());
+        let config: ImageConfiguration = serde_json::from_slice(&config_bytes).unwrap();
+        assert_eq!(config.rootfs().diff_ids().len(), 4);
+        assert_eq!(config.rootfs().diff_ids()[0], base_diff_id);
+        for layer in manifest.layers() {
+            let blob = read_entry(&crate::digest::blob_path(layer.digest()));
+            assert_eq!(sha256_digest(&blob), *layer.digest());
+            assert_eq!(blob.len() as u64, layer.size());
         }
     }
 }

@@ -1,6 +1,10 @@
+use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{ErrorKind, Read};
+use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use oci_spec::image::{Digest, DigestAlgorithm};
@@ -9,6 +13,7 @@ use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 
 use crate::blob::BlobFile;
+use crate::safe_fs::OpenedDir;
 
 pub const DEFAULT_CACHE_DIR: &str = ".rib-cache";
 
@@ -17,6 +22,7 @@ pub const DEFAULT_CACHE_DIR: &str = ".rib-cache";
 #[derive(Clone)]
 pub struct CacheController {
     cache_dir: PathBuf,
+    dir: Arc<OpenedDir>,
 }
 
 impl CacheController {
@@ -26,11 +32,16 @@ impl CacheController {
             .to_path_buf();
         std::fs::create_dir_all(&cache_dir)
             .with_context(|| format!("creating cache dir {}", cache_dir.display()))?;
-        Ok(Self { cache_dir })
+        let dir = Arc::new(OpenedDir::open_path(&cache_dir)?);
+        Ok(Self { cache_dir, dir })
+    }
+
+    fn blob_filename(digest: &Digest) -> String {
+        digest.to_string().replace(':', "-")
     }
 
     fn blob_path(&self, digest: &Digest) -> PathBuf {
-        self.cache_dir.join(digest.to_string().replace(':', "-"))
+        self.cache_dir.join(Self::blob_filename(digest))
     }
 
     pub fn lookup(
@@ -38,17 +49,24 @@ impl CacheController {
         digest: &Digest,
         cancellation: &CancellationToken,
     ) -> Result<Option<BlobFile>> {
-        let path = self.blob_path(digest);
-        let mut file = match File::open(&path) {
+        let filename = Self::blob_filename(digest);
+        let path = self.cache_dir.join(&filename);
+        let mut file = match self.dir.open_regular_file_at(OsStr::new(&filename)) {
             Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "cannot read cached layer; re-downloading");
+                if !path.exists() {
+                    return Ok(None);
+                }
+                tracing::warn!(path = %path.display(), %error, "cannot safely open cached layer; ignoring cache entry");
                 return Ok(None);
             }
         };
         match matches_digest(&mut file, digest, cancellation) {
-            Ok(true) => Ok(Some(BlobFile::cached(path))),
+            Ok(true) => {
+                file.seek(SeekFrom::Start(0))
+                    .context("rewinding verified cached layer")?;
+                Ok(Some(BlobFile::cached(file, path)?))
+            }
             result => {
                 ensure!(!cancellation.is_cancelled(), "cache verification cancelled");
                 match result {
@@ -74,9 +92,17 @@ impl CacheController {
     /// the files held by existing readers.
     pub fn publish(&self, file: NamedTempFile, digest: &Digest) -> Result<BlobFile> {
         let path = self.blob_path(digest);
-        file.persist(&path)
+        #[cfg(unix)]
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o444))
+            .context("marking cache staging file read-only")?;
+        let mut persisted = file
+            .persist(&path)
             .with_context(|| format!("publishing cached layer {digest}"))?;
-        Ok(BlobFile::cached(path))
+        persisted
+            .seek(SeekFrom::Start(0))
+            .context("rewinding published cached layer")?;
+        BlobFile::cached(persisted, path)
     }
 }
 
@@ -193,5 +219,103 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lookup_rejects_symlink_inside_cache_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let cache = CacheController::new(Some(directory.path())).unwrap();
+        let payload = b"symlinked payload";
+        let digest = sha256_digest(payload);
+        let target = outside.path().join("real");
+        std::fs::write(&target, payload).unwrap();
+        symlink(&target, cache.blob_path(&digest)).unwrap();
+
+        assert!(
+            cache
+                .lookup(&digest, &CancellationToken::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn verified_cached_blob_survives_malicious_replacement_after_lookup() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = CacheController::new(Some(directory.path())).unwrap();
+        let payload = b"verified-cache-content";
+        let digest = sha256_digest(payload);
+        let mut pending = cache.staging_file().unwrap();
+        pending.write_all(payload).unwrap();
+        cache.publish(pending, &digest).unwrap();
+
+        let verified = cache
+            .lookup(&digest, &CancellationToken::new())
+            .unwrap()
+            .expect("cache hit");
+
+        // Attacker atomically replaces the cache path after lookup verified it.
+        let mut malicious = cache.staging_file().unwrap();
+        malicious.write_all(b"TAMPERED-BYTES").unwrap();
+        malicious.persist(cache.blob_path(&digest)).unwrap();
+
+        let mut reader = verified.open().unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, payload);
+    }
+
+    #[test]
+    fn concurrent_lookup_and_malicious_replacement_never_yields_tampered_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = CacheController::new(Some(directory.path())).unwrap();
+        let payload = vec![7_u8; 64 * 1024];
+        let digest = sha256_digest(&payload);
+        let mut initial = cache.staging_file().unwrap();
+        initial.write_all(&payload).unwrap();
+        cache.publish(initial, &digest).unwrap();
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let cache_ref = &cache;
+            let digest_ref = &digest;
+            let payload_ref = &payload;
+            let stop_ref = &stop;
+
+            // Attacker thread repeatedly overwrites cache entry with corrupt bytes,
+            // alternating with legitimate atomic publish.
+            let attacker = scope.spawn(move || {
+                for i in 0..100 {
+                    let mut tmp = cache_ref.staging_file().unwrap();
+                    if i % 2 == 0 {
+                        tmp.write_all(b"corrupt").unwrap();
+                    } else {
+                        tmp.write_all(payload_ref).unwrap();
+                    }
+                    let _ = tmp.persist(cache_ref.blob_path(digest_ref));
+                }
+                stop_ref.store(true, std::sync::atomic::Ordering::Release);
+            });
+
+            let reader = scope.spawn(move || {
+                let token = CancellationToken::new();
+                while !stop_ref.load(std::sync::atomic::Ordering::Acquire) {
+                    if let Ok(Some(blob)) = cache_ref.lookup(digest_ref, &token)
+                        && let Ok(mut f) = blob.open()
+                    {
+                        let mut got = Vec::new();
+                        f.read_to_end(&mut got).unwrap();
+                        assert_eq!(got, *payload_ref);
+                    }
+                }
+            });
+
+            attacker.join().unwrap();
+            reader.join().unwrap();
+        });
     }
 }
