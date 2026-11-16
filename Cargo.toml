@@ -54,6 +54,11 @@ tempfile = "3.27.0"
 secrecy = "0.10.3"
 shlex = "2.0.1"
 
+[dev-dependencies]
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+rustls-pki-types = "1.15.1"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["tls12", "aws_lc_rs"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -1,6 +1,8 @@
 use crate::{
-    builder::copy::CopySpec, image::Platform, output_target::OutputTarget,
-    registry::RegistryOptions,
+    builder::copy::CopySpec,
+    image::Platform,
+    output_target::OutputTarget,
+    registry::{NetworkPolicy, RegistryOptions, unique_hosts},
 };
 use anyhow::{Context, Result, bail};
 use oci_client::Reference;
@@ -129,6 +131,7 @@ pub(crate) fn parse_argv(line: &str) -> Result<Vec<String>> {
 pub(crate) struct ImageBuildSpec {
     pub(crate) from: String,
     pub(crate) targets: Vec<OutputTarget>,
+    pub(crate) local_only: bool,
     pub(crate) copies: Vec<CopyDirective>,
     pub(crate) jobs: usize,
     pub(crate) platform: String,
@@ -141,6 +144,7 @@ pub(crate) struct ImageBuildSpec {
     pub(crate) creation_time: String,
     pub(crate) keep_cmd: bool,
     pub(crate) transport: RegistryClientSpec,
+    pub(crate) network_policy: NetworkPolicy,
     pub(crate) cache: CacheSpec,
 }
 
@@ -154,6 +158,7 @@ pub(crate) fn default_jobs() -> usize {
 pub struct BuildRequest {
     pub(super) source: Option<Reference>,
     pub(super) targets: Vec<OutputTarget>,
+    pub(super) local_only: bool,
     pub(super) copies: Vec<CopyDirective>,
     pub(super) jobs: usize,
     pub(super) platform: Platform,
@@ -168,6 +173,22 @@ pub struct BuildRequest {
     pub(super) source_registry: RegistryOptions,
     pub(super) target_registry: RegistryOptions,
     pub(super) cache: CacheSpec,
+}
+
+impl BuildRequest {
+    pub(crate) fn needs_registry_access(&self) -> bool {
+        self.source.is_some() || self.targets.iter().any(OutputTarget::is_registry)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn targets(&self) -> &[OutputTarget] {
+        &self.targets
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_only(&self) -> bool {
+        self.local_only
+    }
 }
 
 #[cfg(test)]
@@ -215,13 +236,42 @@ impl TryFrom<ImageBuildSpec> for BuildRequest {
         if specification.targets.is_empty() {
             bail!("at least one output target is required");
         }
-        let source = if specification.from == "scratch" {
+        specification.network_policy.validate()?;
+        if specification.local_only {
+            let disallowed: Vec<String> = specification
+                .targets
+                .iter()
+                .filter_map(|target| match target {
+                    OutputTarget::Registry { reference } => Some(reference.to_string()),
+                    _ => None,
+                })
+                .collect();
+            if !disallowed.is_empty() {
+                bail!(
+                    "--local-only forbids registry output target(s): {}",
+                    disallowed.join(", ")
+                );
+            }
+        }
+        let source: Option<Reference> = if specification.from == "scratch" {
             None
         } else {
             Some(specification.from.parse().with_context(|| {
                 format!("parsing source image reference {:?}", specification.from)
             })?)
         };
+        if let Some(source) = &source {
+            specification
+                .network_policy
+                .check_registry_host(source.resolve_registry())?;
+        }
+        for target in &specification.targets {
+            if let OutputTarget::Registry { reference } = target {
+                specification
+                    .network_policy
+                    .check_registry_host(reference.resolve_registry())?;
+            }
+        }
         let labels = specification
             .labels
             .into_iter()
@@ -247,11 +297,13 @@ impl TryFrom<ImageBuildSpec> for BuildRequest {
             source.as_ref(),
             &specification.targets,
             specification.transport,
+            &specification.network_policy,
         );
 
         Ok(Self {
             source,
             targets: specification.targets,
+            local_only: specification.local_only,
             copies: specification.copies,
             jobs: specification.jobs,
             platform: Platform::from_str(&specification.platform)?,
@@ -274,39 +326,42 @@ fn registry_options(
     source: Option<&Reference>,
     targets: &[OutputTarget],
     transport: RegistryClientSpec,
+    network_policy: &NetworkPolicy,
 ) -> (RegistryOptions, RegistryOptions) {
+    let source_hosts: Vec<String> = source
+        .map(|s| s.resolve_registry().to_string())
+        .into_iter()
+        .collect();
     let source = RegistryOptions {
         plain_http_hosts: source
             .filter(|_| transport.source_plain_http)
             .map(|source| source.resolve_registry().to_string())
             .into_iter()
             .collect(),
+        registry_hosts: source_hosts,
         skip_tls_verify: source.is_some() && transport.source_skip_tls,
         connect_timeout: transport.connect_timeout,
         read_timeout: transport.read_timeout,
         max_attempts: transport.max_attempts,
+        network_policy: network_policy.clone(),
     };
-    let mut target_hosts: Vec<String> = if transport.target_plain_http {
-        targets
-            .iter()
-            .filter_map(|target| match target {
-                OutputTarget::Registry { reference } => {
-                    Some(reference.resolve_registry().to_string())
-                }
-                _ => None,
-            })
-            .collect()
+    let all_target_hosts = unique_hosts(targets.iter().filter_map(|target| match target {
+        OutputTarget::Registry { reference } => Some(reference.resolve_registry().to_string()),
+        _ => None,
+    }));
+    let target_plain_http_hosts: Vec<String> = if transport.target_plain_http {
+        all_target_hosts.clone()
     } else {
         Vec::new()
     };
-    target_hosts.sort();
-    target_hosts.dedup();
     let target = RegistryOptions {
-        plain_http_hosts: target_hosts,
+        plain_http_hosts: target_plain_http_hosts,
+        registry_hosts: all_target_hosts,
         skip_tls_verify: transport.target_skip_tls,
         connect_timeout: transport.connect_timeout,
         read_timeout: transport.read_timeout,
         max_attempts: transport.max_attempts,
+        network_policy: network_policy.clone(),
     };
     (source, target)
 }
@@ -349,6 +404,7 @@ mod tests {
         let specification = |transport: RegistryClientSpec| ImageBuildSpec {
             from: "scratch".to_string(),
             targets: vec![target.clone()],
+            local_only: false,
             copies: Vec::new(),
             jobs: 1,
             platform: "linux/amd64".to_string(),
@@ -361,6 +417,7 @@ mod tests {
             creation_time: "epoch".to_string(),
             keep_cmd: false,
             transport,
+            network_policy: NetworkPolicy::default(),
             cache: CacheSpec::default(),
         };
 
@@ -426,6 +483,7 @@ mod tests {
                 connect_timeout: Duration::from_secs(60),
                 max_attempts: 3,
             },
+            &NetworkPolicy::default(),
         );
 
         assert_eq!(source_options.plain_http_hosts, vec!["source.test"]);
@@ -437,8 +495,12 @@ mod tests {
     #[test]
     fn registry_transport_defaults_are_strict() {
         let source: Reference = "source.test/base:latest".parse().unwrap();
-        let (source_options, target_options) =
-            registry_options(Some(&source), &[], RegistryClientSpec::default());
+        let (source_options, target_options) = registry_options(
+            Some(&source),
+            &[],
+            RegistryClientSpec::default(),
+            &NetworkPolicy::default(),
+        );
         assert!(source_options.plain_http_hosts.is_empty());
         assert!(!source_options.skip_tls_verify);
         assert!(target_options.plain_http_hosts.is_empty());
@@ -451,6 +513,7 @@ mod tests {
         let specification = |from: &str| ImageBuildSpec {
             from: from.to_string(),
             targets: vec![target.clone()],
+            local_only: false,
             copies: Vec::new(),
             jobs: 1,
             platform: "linux/amd64".to_string(),
@@ -463,6 +526,7 @@ mod tests {
             creation_time: "epoch".to_string(),
             keep_cmd: false,
             transport: RegistryClientSpec::default(),
+            network_policy: NetworkPolicy::default(),
             cache: CacheSpec {
                 enable: false,
                 cache_path: None,
@@ -493,9 +557,70 @@ mod tests {
                 source_skip_tls: true,
                 ..RegistryClientSpec::default()
             },
+            &NetworkPolicy::default(),
         );
 
         assert!(source_options.plain_http_hosts.is_empty());
         assert!(!source_options.skip_tls_verify);
+    }
+
+    #[test]
+    fn local_only_and_allow_registry_validate_before_execution() {
+        let spec = ImageBuildSpec {
+            from: "scratch".to_string(),
+            targets: vec![
+                "registry:ghcr.io/example/app:v1"
+                    .parse::<OutputTarget>()
+                    .unwrap(),
+            ],
+            local_only: true,
+            copies: Vec::new(),
+            jobs: 1,
+            platform: "linux/amd64".to_string(),
+            entrypoint: None,
+            cmd: None,
+            labels: Vec::new(),
+            ports: Vec::new(),
+            workdir: None,
+            user: None,
+            creation_time: "epoch".to_string(),
+            keep_cmd: false,
+            transport: RegistryClientSpec::default(),
+            network_policy: NetworkPolicy::default(),
+            cache: CacheSpec::default(),
+        };
+        let error = BuildRequest::try_from(spec)
+            .err()
+            .expect("local_only must reject registry target")
+            .to_string();
+        assert!(error.contains("--local-only"));
+
+        let spec = ImageBuildSpec {
+            from: "docker.io/library/debian:bookworm".to_string(),
+            targets: vec!["oci-archive:out.tar".parse::<OutputTarget>().unwrap()],
+            local_only: true,
+            copies: Vec::new(),
+            jobs: 1,
+            platform: "linux/amd64".to_string(),
+            entrypoint: None,
+            cmd: None,
+            labels: Vec::new(),
+            ports: Vec::new(),
+            workdir: None,
+            user: None,
+            creation_time: "epoch".to_string(),
+            keep_cmd: false,
+            transport: RegistryClientSpec::default(),
+            network_policy: NetworkPolicy {
+                allowed_registries: vec!["ghcr.io".to_string()],
+                ..NetworkPolicy::default()
+            },
+            cache: CacheSpec::default(),
+        };
+        let error = BuildRequest::try_from(spec)
+            .err()
+            .expect("allowed_registries must reject docker.io")
+            .to_string();
+        assert!(error.contains("--allow-registry"));
     }
 }

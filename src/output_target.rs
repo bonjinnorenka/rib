@@ -15,6 +15,10 @@ impl OutputTarget {
     pub fn is_archive(&self) -> bool {
         matches!(self, Self::OciArchive { .. } | Self::DockerArchive { .. })
     }
+
+    pub fn is_registry(&self) -> bool {
+        matches!(self, Self::Registry { .. })
+    }
 }
 
 impl FromStr for OutputTarget {

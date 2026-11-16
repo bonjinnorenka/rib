@@ -9,6 +9,7 @@ use crate::app::spec::{
 };
 use crate::output_target::OutputTarget;
 use crate::progress::ProgressMode;
+use crate::registry::NetworkPolicy;
 
 #[derive(Parser)]
 #[command(name = "rib", version, about = "Minimal jib-like OCI image builder")]
@@ -120,19 +121,56 @@ pub struct RegistryClientArgs {
     /// Attempts per registry operation before giving up [default: 3]
     #[arg(long)]
     pub max_attempts: Option<usize>,
+
+    /// Restrict source and target registries to these hostnames (repeatable)
+    #[arg(long = "allow-registry")]
+    pub allow_registry: Vec<String>,
+
+    /// Restrict credential transmission (Basic/Bearer exchange) to these hostnames (repeatable)
+    #[arg(long = "allow-auth-host")]
+    pub allow_auth_host: Vec<String>,
+
+    /// Allow external descriptor blob URLs and restrict blob CDN redirects to these hostnames (repeatable)
+    #[arg(long = "allow-blob-host")]
+    pub allow_blob_host: Vec<String>,
+
+    /// Allow loopback and RFC1918/ULA private IPs for local test registries (cloud metadata remains blocked)
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub allow_private_network: Option<bool>,
+}
+
+impl RegistryClientArgs {
+    pub(crate) fn network_policy(&self) -> NetworkPolicy {
+        NetworkPolicy {
+            allowed_registries: self.allow_registry.clone(),
+            allowed_auth_hosts: self.allow_auth_host.clone(),
+            allowed_blob_hosts: self.allow_blob_host.clone(),
+            allow_private_network: self.allow_private_network.unwrap_or(false),
+        }
+    }
 }
 
 impl From<&RegistryClientArgs> for RegistryOverrides {
     fn from(arguments: &RegistryClientArgs) -> Self {
         Self {
             source_plain_http: arguments.from_plain_http,
-            source_skip_tls: arguments.from_skip_tls,
+            source_skip_tls: arguments.source_skip_tls(),
             target_plain_http: arguments.to_plain_http,
-            target_skip_tls: arguments.to_skip_tls,
+            target_skip_tls: arguments.target_skip_tls(),
             connect_timeout: arguments.connect_timeout.map(Duration::from_secs),
             read_timeout: arguments.read_timeout.map(Duration::from_secs),
             max_attempts: arguments.max_attempts,
         }
+    }
+}
+
+impl RegistryClientArgs {
+    fn source_skip_tls(&self) -> Option<bool> {
+        self.from_skip_tls
+    }
+
+    fn target_skip_tls(&self) -> Option<bool> {
+        self.to_skip_tls
     }
 }
 
@@ -169,6 +207,10 @@ pub struct BuildArgs {
     ///   registry:<image-ref>
     #[arg(long = "to", required = true, verbatim_doc_comment)]
     pub targets: Vec<OutputTarget>,
+
+    /// Forbid pushing to container registries; allow only local archive outputs
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub local_only: Option<bool>,
 
     /// Copy a local path into the image. Repeatable; each --copy
     /// becomes its own layer in flag order
@@ -221,9 +263,11 @@ impl TryFrom<BuildArgs> for ImageBuildSpec {
             .map(CopyDirective::parse)
             .collect::<Result<_>>()?;
 
+        let network_policy = arguments.client.network_policy();
         Ok(Self {
             from: arguments.from,
             targets: arguments.targets,
+            local_only: arguments.local_only.unwrap_or(false),
             copies,
             jobs: arguments.jobs,
             platform: arguments.platform,
@@ -241,6 +285,7 @@ impl TryFrom<BuildArgs> for ImageBuildSpec {
             creation_time: arguments.creation_time,
             keep_cmd: arguments.image.keep_cmd.unwrap_or_default(),
             transport: RegistryOverrides::from(&arguments.client).into(),
+            network_policy,
             cache: arguments.cache.into(),
         })
     }
@@ -288,6 +333,10 @@ mod tests {
             read_timeout: None,
             connect_timeout: None,
             max_attempts: Some(5),
+            allow_registry: Vec::new(),
+            allow_auth_host: Vec::new(),
+            allow_blob_host: Vec::new(),
+            allow_private_network: None,
         };
         let spec: RegistryClientSpec = RegistryOverrides::from(&arguments).into();
         assert_eq!(spec.read_timeout, DEFAULT_READ_TIMEOUT);

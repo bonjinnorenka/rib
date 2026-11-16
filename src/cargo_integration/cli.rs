@@ -37,9 +37,13 @@ pub(super) struct CargoRibArgs {
     #[arg(long)]
     pub(super) from: Option<String>,
 
-    /// Output target. Repeatable; appended to targets from package.metadata.rib
+    /// Output target. Repeatable; replaces targets from package.metadata.rib
     #[arg(long = "to")]
     pub(super) targets: Vec<OutputTarget>,
+
+    /// Forbid pushing to container registries; allow only local archive outputs
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub(super) local_only: Option<bool>,
 
     /// Exact path of the artifact inside the image. Defaults to /app/<artifact-name>
     #[arg(long)]

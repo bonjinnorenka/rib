@@ -1,10 +1,14 @@
 // Adapter around oci-client. OCI descriptors are converted to oci-spec at the
 // boundary; layer blobs remain lazy so pushes can cross-mount them
 
+mod net_policy;
 mod retry;
 mod token;
+pub use net_policy::{NetworkPolicy, unique_hosts};
+use net_policy::{PolicyDnsResolver, ValidatingProxy};
 use retry::{RetryPolicy, retry_registry};
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
@@ -42,28 +46,32 @@ pub const DEFAULT_MAX_ATTEMPTS: usize = 3;
 #[derive(Debug, Clone)]
 pub struct RegistryOptions {
     pub plain_http_hosts: Vec<String>,
+    pub registry_hosts: Vec<String>,
     /// If true, accept invalid TLS certs and hostnames. Applies globally —
     /// oci-client's reqwest backend has no per-host hook for this
     pub skip_tls_verify: bool,
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
     pub max_attempts: usize,
+    pub network_policy: NetworkPolicy,
 }
 
 impl Default for RegistryOptions {
     fn default() -> Self {
         Self {
             plain_http_hosts: Vec::new(),
+            registry_hosts: Vec::new(),
             skip_tls_verify: false,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             read_timeout: DEFAULT_READ_TIMEOUT,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
+            network_policy: NetworkPolicy::default(),
         }
     }
 }
 
 impl RegistryOptions {
-    fn client_config(&self) -> ClientConfig {
+    fn client_config(&self, proxy_url: Option<&str>) -> ClientConfig {
         ClientConfig {
             protocol: if self.plain_http_hosts.is_empty() {
                 ClientProtocol::Https
@@ -73,15 +81,21 @@ impl RegistryOptions {
             accept_invalid_certificates: self.skip_tls_verify,
             connect_timeout: Some(self.connect_timeout),
             read_timeout: Some(self.read_timeout),
+            https_proxy: proxy_url.map(str::to_string),
+            http_proxy: proxy_url.map(str::to_string),
             ..Default::default()
         }
     }
 }
 
+type RepoClientKey = (String, String, bool);
+
 #[derive(Clone)]
 pub struct RegistryClient {
-    inner: Client,
     tokens: token::TokenClient,
+    blob_http: reqwest::Client,
+    proxy: Arc<ValidatingProxy>,
+    repo_clients: Arc<tokio::sync::Mutex<HashMap<RepoClientKey, (Client, RegistryAuth)>>>,
     options: RegistryOptions,
     credentials: Arc<Credentials>,
     platform: Platform,
@@ -99,9 +113,53 @@ impl RegistryClient {
         platform: Platform,
         options: RegistryOptions,
     ) -> Result<Self> {
+        options.network_policy.validate()?;
         let tokens =
             token::TokenClient::new(&options).context("creating registry token HTTP client")?;
-        let resolver_platform = platform.clone();
+        let resolver = Arc::new(PolicyDnsResolver::new(
+            options.network_policy.allow_private_network,
+        ));
+        let blob_http = reqwest::Client::builder()
+            .danger_accept_invalid_certs(options.skip_tls_verify)
+            .connect_timeout(options.connect_timeout)
+            .read_timeout(options.read_timeout)
+            .dns_resolver(resolver)
+            .no_proxy()
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("creating registry blob fallback HTTP client")?;
+        let proxy = Arc::new(
+            ValidatingProxy::start(
+                options.network_policy.clone(),
+                options.plain_http_hosts.clone(),
+                options.registry_hosts.clone(),
+                options.connect_timeout,
+            )
+            .context("starting registry validating proxy")?,
+        );
+        Ok(Self {
+            tokens,
+            blob_http,
+            proxy,
+            repo_clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            credentials: Arc::new(credentials),
+            platform,
+            retry_policy: RetryPolicy {
+                max_attempts: options.max_attempts,
+                initial_delay: Duration::from_millis(250),
+                max_delay: Duration::from_secs(2),
+            },
+            options,
+        })
+    }
+
+    fn build_oci_client(&self) -> oci_client::errors::Result<Client> {
+        let resolver_platform = self.platform.clone();
         let cfg = ClientConfig {
             // The default resolver selects the host platform, which is wrong
             // for cross-builds
@@ -119,33 +177,46 @@ impl RegistryClient {
                     })
                     .map(|e| e.digest.clone())
             })),
-            ..options.client_config()
+            ..self.options.client_config(Some(&self.proxy.url()))
         };
-        let inner = Client::try_from(cfg).context("creating OCI registry HTTP client")?;
-        Ok(Self {
-            inner,
-            tokens,
-            credentials: Arc::new(credentials),
-            platform,
-            retry_policy: RetryPolicy {
-                max_attempts: options.max_attempts,
-                initial_delay: Duration::from_millis(250),
-                max_delay: Duration::from_secs(2),
-            },
-            options,
-        })
+        Client::try_from(cfg)
+    }
+
+    async fn client_for_repo(
+        &self,
+        reference: &Reference,
+        is_push: bool,
+    ) -> oci_client::errors::Result<(Client, RegistryAuth)> {
+        let registry = reference.resolve_registry().to_string();
+        let key = (
+            registry.clone(),
+            reference.repository().to_string(),
+            is_push,
+        );
+        if let Some(cached) = self.repo_clients.lock().await.get(&key).cloned() {
+            return Ok(cached);
+        }
+
+        let raw_auth = self.registry_auth_for(&registry);
+        let resolved_auth = self
+            .tokens
+            .resolve_auth(reference, &raw_auth, is_push)
+            .await?;
+        let client = self.build_oci_client()?;
+        client.store_auth_if_needed(&registry, &resolved_auth).await;
+
+        let mut guard = self.repo_clients.lock().await;
+        let entry = guard.entry(key).or_insert_with(|| (client, resolved_auth));
+        Ok(entry.clone())
     }
 
     /// Pull base image: resolve manifest list -> platform manifest -> config
     /// Layer bytes are not fetched
     pub async fn pull_base(&self, reference: &Reference) -> Result<Image> {
-        let registry = reference.resolve_registry().to_string();
-
-        let auth = self.registry_auth_for(&registry);
-
         let (manifest, manifest_digest, config_json) =
-            retry_registry("pull manifest and config", self.retry_policy, || {
-                self.inner.pull_manifest_and_config(reference, &auth)
+            retry_registry("pull manifest and config", self.retry_policy, || async {
+                let (client, auth) = self.client_for_repo(reference, false).await?;
+                client.pull_manifest_and_config(reference, &auth).await
             })
             .await
             .with_context(|| format!("pulling manifest+config for {reference}"))?;
@@ -201,12 +272,6 @@ impl RegistryClient {
         }
     }
 
-    async fn ensure_auth(&self, reference: &Reference) {
-        let auth = self.registry_auth_for(reference.resolve_registry());
-        self.inner
-            .store_auth_if_needed(reference.resolve_registry(), &auth)
-            .await;
-    }
     /// Fetch a blob (layer or any other content-addressable object)
     /// `repo_ref` should reference the repository the blob lives in (registry + repo);
     /// the digest in the descriptor identifies the actual blob
@@ -220,20 +285,21 @@ impl RegistryClient {
     where
         F: Fn(u64) + Send + Sync,
     {
-        self.ensure_auth(reference).await;
-
+        // Strip unvalidated external descriptor URLs before passing to oci-client;
+        // allowed external URLs are handled below through our policy-enforced HTTP client.
         let oc = OciDescriptor {
             media_type: descriptor.media_type().to_string(),
             digest: descriptor.digest().to_string(),
             size: i64::try_from(descriptor.size())
                 .context("descriptor size does not fit in i64")?,
-            urls: descriptor.urls().clone(),
+            urls: None,
             annotations: descriptor
                 .annotations()
                 .as_ref()
                 .map(|a| a.clone().into_iter().collect()),
             artifact_type: descriptor.artifact_type().as_ref().map(ToString::to_string),
         };
+        let fallback_urls = descriptor.urls().clone().unwrap_or_default();
 
         let destination = file.try_clone().context("cloning download file")?;
         let on_progress = Arc::new(on_progress);
@@ -243,6 +309,7 @@ impl RegistryClient {
                 &destination,
                 reference,
                 &oc,
+                &fallback_urls,
                 on_progress.as_ref(),
                 &reported_bytes,
             )
@@ -256,6 +323,7 @@ impl RegistryClient {
         file: &File,
         reference: &Reference,
         descriptor: &OciDescriptor,
+        fallback_urls: &[String],
         on_progress: &F,
         reported_bytes: &AtomicU64,
     ) -> oci_client::errors::Result<()>
@@ -266,35 +334,163 @@ impl RegistryClient {
         let mut writer = tokio::fs::File::from_std(file.try_clone()?);
         writer.set_len(0).await?;
         writer.seek(SeekFrom::Start(0)).await?;
-        let mut stream = self.inner.pull_blob_stream(reference, descriptor).await?;
-        let mut attempt_bytes = 0_u64;
-        let mut hasher = Sha256::new();
+        let (client, _) = self.client_for_repo(reference, false).await?;
+        let stream_result = client.pull_blob_stream(reference, descriptor).await;
+        match stream_result {
+            Ok(mut stream) => {
+                let mut attempt_bytes = 0_u64;
+                let mut hasher = Sha256::new();
 
-        while let Some(chunk) = stream.try_next().await? {
-            hasher.update(&chunk);
-            writer.write_all(&chunk).await?;
-            attempt_bytes += chunk.len() as u64;
-            report_progress_high_det(reported_bytes, attempt_bytes, on_progress);
-        }
+                while let Some(chunk) = stream.try_next().await? {
+                    hasher.update(&chunk);
+                    writer.write_all(&chunk).await?;
+                    attempt_bytes += chunk.len() as u64;
+                    report_progress_high_det(reported_bytes, attempt_bytes, on_progress);
+                }
 
-        writer.flush().await?;
-        writer.sync_all().await?;
-        verify_layer_digest(&descriptor.digest, hasher)?;
-        if attempt_bytes != descriptor.size as u64 {
-            return Err(OciDistributionError::SpecViolationError(format!(
-                "blob size mismatch: expected {}, received {attempt_bytes}",
-                descriptor.size
-            )));
+                writer.flush().await?;
+                writer.sync_all().await?;
+                verify_layer_digest(&descriptor.digest, hasher)?;
+                if attempt_bytes != descriptor.size as u64 {
+                    return Err(OciDistributionError::SpecViolationError(format!(
+                        "blob size mismatch: expected {}, received {attempt_bytes}",
+                        descriptor.size
+                    )));
+                }
+                Ok(())
+            }
+            Err(primary_error) => {
+                if fallback_urls.is_empty()
+                    || self.options.network_policy.allowed_blob_hosts.is_empty()
+                {
+                    return Err(primary_error);
+                }
+                self.fetch_from_external_urls(
+                    &mut writer,
+                    descriptor,
+                    fallback_urls,
+                    on_progress,
+                    reported_bytes,
+                    primary_error,
+                )
+                .await
+            }
         }
-        Ok(())
+    }
+
+    async fn fetch_from_external_urls<F>(
+        &self,
+        writer: &mut tokio::fs::File,
+        descriptor: &OciDescriptor,
+        fallback_urls: &[String],
+        on_progress: &F,
+        reported_bytes: &AtomicU64,
+        primary_error: OciDistributionError,
+    ) -> oci_client::errors::Result<()>
+    where
+        F: Fn(u64) + Sync + ?Sized,
+    {
+        let mut last_error = primary_error;
+        for raw_url in fallback_urls {
+            let Ok(mut current_url) = reqwest::Url::parse(raw_url) else {
+                continue;
+            };
+            if let Err(error) = self
+                .options
+                .network_policy
+                .check_external_blob_url(&current_url, &self.options.plain_http_hosts)
+            {
+                warn!(url = %raw_url, %error, "ignoring disallowed external blob URL");
+                continue;
+            }
+
+            // Follow at most 5 redirects, validating every hop and never attaching auth headers.
+            let mut hops = 0usize;
+            let response = loop {
+                let resp = match self
+                    .blob_http
+                    .get(current_url.clone())
+                    .header(
+                        reqwest::header::ACCEPT,
+                        "application/vnd.oci.image.manifest.v1+json",
+                    )
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(error) => {
+                        last_error = OciDistributionError::RequestError(error);
+                        break None;
+                    }
+                };
+                if resp.status().is_redirection() && hops < 5 {
+                    let Some(loc) = resp
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                    else {
+                        break None;
+                    };
+                    let Ok(next_url) = current_url.join(loc) else {
+                        break None;
+                    };
+                    if let Err(error) = self
+                        .options
+                        .network_policy
+                        .check_external_blob_url(&next_url, &self.options.plain_http_hosts)
+                    {
+                        warn!(url = %next_url, %error, "blocked external blob redirect");
+                        break None;
+                    }
+                    current_url = next_url;
+                    hops += 1;
+                    continue;
+                }
+                break Some(resp);
+            };
+
+            let Some(mut response) = response else {
+                continue;
+            };
+            if !response.status().is_success() {
+                last_error = OciDistributionError::ServerError {
+                    code: response.status().as_u16(),
+                    url: current_url.to_string(),
+                    message: "external blob fetch failed".into(),
+                };
+                continue;
+            }
+
+            writer.set_len(0).await?;
+            writer.seek(SeekFrom::Start(0)).await?;
+            let mut attempt_bytes = 0_u64;
+            let mut hasher = Sha256::new();
+            while let Some(chunk) = response.chunk().await? {
+                hasher.update(&chunk);
+                writer.write_all(&chunk).await?;
+                attempt_bytes += chunk.len() as u64;
+                report_progress_high_det(reported_bytes, attempt_bytes, on_progress);
+            }
+            writer.flush().await?;
+            writer.sync_all().await?;
+            verify_layer_digest(&descriptor.digest, hasher)?;
+            if attempt_bytes != descriptor.size as u64 {
+                return Err(OciDistributionError::SpecViolationError(format!(
+                    "blob size mismatch: expected {}, received {attempt_bytes}",
+                    descriptor.size
+                )));
+            }
+            return Ok(());
+        }
+        Err(last_error)
     }
 
     /// Check if a blob already exists in the target repository
     /// Avoids re-uploading layers that the registry already has
     pub async fn blob_exists(&self, reference: &Reference, digest: &Digest) -> Result<bool> {
-        self.ensure_auth(reference).await;
-        retry_registry("check blob", self.retry_policy, || {
-            self.inner.blob_exists(reference, digest.as_ref())
+        retry_registry("check blob", self.retry_policy, || async {
+            let (client, _) = self.client_for_repo(reference, true).await?;
+            client.blob_exists(reference, digest.as_ref()).await
         })
         .await
         .with_context(|| format!("checking blob {digest} in {reference}"))
@@ -320,7 +516,7 @@ impl RegistryClient {
             // Client::clone shares the auth store and token cache. A fresh
             // instance keeps each mount's token independent of other sources
             // and ordinary pull/push authentication.
-            let client = Client::try_from(self.options.client_config())?;
+            let client = Client::try_from(self.options.client_config(Some(&self.proxy.url())))?;
             client.store_auth_if_needed(registry, &mount_auth).await;
             client.mount_blob(target, source, digest.as_ref()).await
         })
@@ -340,7 +536,6 @@ impl RegistryClient {
     {
         file.seek(SeekFrom::Start(0))
             .context("rewinding blob file")?;
-        self.ensure_auth(reference).await;
 
         let source = file.try_clone().context("cloning blob file handle")?;
         let on_progress = Arc::new(on_progress);
@@ -369,6 +564,7 @@ impl RegistryClient {
     where
         F: Fn(u64) + Sync + ?Sized,
     {
+        let (client, _) = self.client_for_repo(reference, true).await?;
         let mut file = source.try_clone()?;
         file.seek(SeekFrom::Start(0))?;
         let mut async_file = tokio::fs::File::from_std(file);
@@ -384,7 +580,7 @@ impl RegistryClient {
                 chunk
             })
             .map_err(oci_client::errors::OciDistributionError::from);
-        self.inner
+        client
             .push_blob_stream(reference, stream, digest.as_ref())
             .await?;
         Ok(())
@@ -396,11 +592,12 @@ impl RegistryClient {
         digest: &Digest,
         bytes: &[u8],
     ) -> Result<()> {
-        self.ensure_auth(reference).await;
         let bytes = bytes::Bytes::copy_from_slice(bytes);
-        retry_registry("push config blob", self.retry_policy, || {
-            self.inner
+        retry_registry("push config blob", self.retry_policy, || async {
+            let (client, _) = self.client_for_repo(reference, true).await?;
+            client
                 .push_blob(reference, bytes.clone(), digest.as_ref())
+                .await
         })
         .await
         .with_context(|| format!("pushing blob {digest} to {reference}"))?;
@@ -408,16 +605,18 @@ impl RegistryClient {
     }
 
     pub async fn push_manifest(&self, reference: &Reference, manifest_json: &[u8]) -> Result<()> {
-        self.ensure_auth(reference).await;
         let body = bytes::Bytes::copy_from_slice(manifest_json);
-        retry_registry("push manifest", self.retry_policy, || {
-            self.inner.push_manifest_raw(
-                reference,
-                body.clone(),
-                reqwest::header::HeaderValue::from_static(
-                    "application/vnd.oci.image.manifest.v1+json",
-                ),
-            )
+        retry_registry("push manifest", self.retry_policy, || async {
+            let (client, _) = self.client_for_repo(reference, true).await?;
+            client
+                .push_manifest_raw(
+                    reference,
+                    body.clone(),
+                    reqwest::header::HeaderValue::from_static(
+                        "application/vnd.oci.image.manifest.v1+json",
+                    ),
+                )
+                .await
         })
         .await
         .with_context(|| format!("pushing manifest to {reference}"))?;
@@ -625,5 +824,723 @@ mod tests {
         }
 
         assert_eq!(sizes, [UPLOAD_CHUNK_SIZE, UPLOAD_CHUNK_SIZE, 1]);
+    }
+
+    const TEST_TLS_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIC9TCCAd2gAwIBAgIUMlwyge7TFOWNOr6pXGjhJd7kZVYwDQYJKoZIhvcNAQEL\n\
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTExNjEzMzQ1NVoYDzIxMjYx\n\
+MDIzMTMzNDU1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB\n\
+AQUAA4IBDwAwggEKAoIBAQCvnAakiRhig2vMj+S8E3sZ+Q+xj+DrIfdJVVBs0GGM\n\
+VHVnXaL4aT1/KBCvHuVik8glEnDhTdiUM8AO73vVUYfq+n8IsS1eHndEvn4eClZI\n\
+I+Y1a2fgbRlL12La3G1g6xnYssEzJnsG9JA8+xTANPp3RrcqJElldmB8q9pEfNSK\n\
+AbQuLwzLrQdE6PqAKxnAy80FhvDYARZ01lqK73E7WLS9HDoAqGYxe3HtFMSR/q57\n\
+PpCwO62vnf4omFNIcGHViwvrKQpqI6u6baJvC9O9TzBWrOJ46vd6SvL2pxpPAPwr\n\
+7+LWvwT6LyZWrWXBY8kJuxyQsOhFceKrv8tub2tU6YLDAgMBAAGjPTA7MBoGA1Ud\n\
+EQQTMBGCCWxvY2FsaG9zdIcEfwAAATAdBgNVHQ4EFgQUFTUk/w6E8j8tOkxPe/KN\n\
+Dru1Cb8wDQYJKoZIhvcNAQELBQADggEBAHLeHxguuw+kNXW/YPN0xFzJLj1/UiZh\n\
+uS8xQ7caIdaA2WTwJq9n4JK8TuK7GtL7cZutCYtmuspyhm0+9UtuelQe1ZItYpVj\n\
+TQXfCg+OCrHvChpt6WgQt0rUEbHeqnKrptlAlMCAaIpASLM6C1cWd/qlmAGao+2i\n\
+sEuiemavrczlbDOhilyrdxEEvrb6t+49DCIWpxq4za1F0+WQ1L8Iigus+zhkicBX\n\
+EL9kSWKPxL3W7soXYnPGplu8KkY+tfNdaOX12AdPdzkWgh2jvVyHTad/XXDHqif2\n\
+TaI1GagkvSQZvwMgDvhjJIEHz8CKJeaE1X1PeUhDn6uRnJEsIr3l8+A=\n\
+-----END CERTIFICATE-----\n";
+
+    const TEST_TLS_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggShAgEAAoIBAQCvnAakiRhig2vM\n\
+j+S8E3sZ+Q+xj+DrIfdJVVBs0GGMVHVnXaL4aT1/KBCvHuVik8glEnDhTdiUM8AO\n\
+73vVUYfq+n8IsS1eHndEvn4eClZII+Y1a2fgbRlL12La3G1g6xnYssEzJnsG9JA8\n\
++xTANPp3RrcqJElldmB8q9pEfNSKAbQuLwzLrQdE6PqAKxnAy80FhvDYARZ01lqK\n\
+73E7WLS9HDoAqGYxe3HtFMSR/q57PpCwO62vnf4omFNIcGHViwvrKQpqI6u6baJv\n\
+C9O9TzBWrOJ46vd6SvL2pxpPAPwr7+LWvwT6LyZWrWXBY8kJuxyQsOhFceKrv8tu\n\
+b2tU6YLDAgMBAAECggEAFlpP5iWlOvTrhdBTFzWLl9TCEKH1yTg7l9QKNq+Xmxst\n\
+Dok2s1QCBet9pCzUmeWhtkZQo/0aslKcAcquAossN9bG0L5svew21kNBHmXGccxQ\n\
+A0C2qjR44dR6us0QByQl2BV4zh/5zPrYWUrEa2rS7tfLfMu9o/KbeYMOd2VEUISM\n\
+oThZLXApYOlQwdtomf3kVxFSxal0lzW5tbfp6gODJ/L3Lyz1ooWEqe4wXecdzzYc\n\
+90Px+voGHJ5vFKJTTLorD0BRdQbWGDJ7dBRcksBhJK5dM47/z5nl0PiDk0FllQVA\n\
+4Bcmx5J9EyGxztqqHRJzmRF4ppfCPOjw6qnCS94NAQKBgQDvTVw02zXlljzLTala\n\
+LtnYAmBNC+oFu+ghprro7ZQVxiCIPlucRMK3as7x9UWdDlnOiMIpF5WjqgW0QDoW\n\
+BmiwGlNpi+O6MrPedgynW83jAJw+ns2XwGuSCzxyqLYlG2/WqhxBR9qls9aLE2pu\n\
+EgRTlnL/XXmXsNxpcNbYfSwNgwKBgQC73O1I0Q+gVG2m97QQDXrwQcPUQRDrggzx\n\
+hyuk6ET756KqBXDqGgsPGicQakmeJp7IvZKk2XWhjF2Z92nK8r+sHRUxPrlfXJ8z\n\
+SrGyVLWowQ8MQVfigBCuePCfTzsp2Rz9V2oGsnmtNPPLgLmttfZ5FJnMbPWg0yRD\n\
+QNfyHCnxwQKBgQCtYiO4uEtouV36/54AlYmJFM+pg0RgOzGJkEBEnD57OD5B+Mxv\n\
+gPKD6oNelBOII+m11yi2lTv6hSn028Q6SRJ45doh0xWAx1PDj0zDxaR7IOoUBQN5\n\
+PBW0jyeQ++RdJm/13PLz6ZfmD1MXGU43yh4QYiWYGKYM3jwUuYkw+iB8+QJ/Uuwx\n\
+0PJ2805RGGI+GNfabDKbPhV6YnoFPJdtrFzaFlcodePw82SLfR8OHzDLTgO+Et2a\n\
+3Skfwy8yIcQT7oE4GcC8mgAV0wIPQ5S02wKJLPQKsF4nbNMaiejYTXmro80x/qGX\n\
+K12cV9gHxMwNKaAoK0nsmU9/HH4Wg5kbuMK1wQKBgDSyPusRU8k18NjKOAgZwZsX\n\
+13wjsa9Bn5ZTPux7aFBE+46S9Kt0TDWeVMq+Rot8FMOax+XtEONM38HCfh8VBqKO\n\
+m5uh6b/3c6cXDEwhCzlcZTbYLW8k0zO1dJk0oB7SvCnEhsmDIEWLovjOjoJlB7dA\n\
+seTuix+/DtzfmDHobU29\n\
+-----END PRIVATE KEY-----\n";
+
+    #[derive(Clone)]
+    struct RecordedRequest {
+        #[allow(dead_code)]
+        method: String,
+        path: String,
+        headers: HashMap<String, String>,
+    }
+
+    struct MockHttpServer {
+        port: u16,
+        requests: Arc<tokio::sync::Mutex<Vec<RecordedRequest>>>,
+        shutdown: tokio_util::sync::CancellationToken,
+    }
+
+    impl Drop for MockHttpServer {
+        fn drop(&mut self) {
+            self.shutdown.cancel();
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockHttpResponse {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl MockHttpResponse {
+        fn json(status: u16, body: &str) -> Self {
+            Self {
+                status,
+                headers: vec![("Content-Type".into(), "application/json".into())],
+                body: body.as_bytes().to_vec(),
+            }
+        }
+
+        fn bytes(status: u16, content_type: &str, body: Vec<u8>) -> Self {
+            Self {
+                status,
+                headers: vec![("Content-Type".into(), content_type.into())],
+                body,
+            }
+        }
+    }
+
+    fn test_tls_acceptor() -> tokio_rustls::TlsAcceptor {
+        use rustls_pki_types::pem::PemObject;
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+        let certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(TEST_TLS_CERT_PEM.as_bytes())
+                .map(|item| item.unwrap())
+                .collect();
+        let key = PrivateKeyDer::from_pem_slice(TEST_TLS_KEY_PEM.as_bytes()).unwrap();
+        let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+        tokio_rustls::TlsAcceptor::from(Arc::new(cfg))
+    }
+
+    async fn spawn_mock_server<F>(tls: bool, handler: F) -> MockHttpServer
+    where
+        F: Fn(&RecordedRequest) -> MockHttpResponse + Send + Sync + 'static,
+    {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let acceptor = tls.then(test_tls_acceptor);
+        let handler = Arc::new(handler);
+
+        let task_reqs = requests.clone();
+        let task_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = task_shutdown.cancelled() => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break; };
+                        let acceptor = acceptor.clone();
+                        let handler = handler.clone();
+                        let reqs = task_reqs.clone();
+                        tokio::spawn(async move {
+                            let mut io: Box<dyn AsyncReadWrite + Send + Unpin> = match acceptor {
+                                Some(acc) => match acc.accept(stream).await {
+                                    Ok(s) => Box::new(s),
+                                    Err(_) => return,
+                                },
+                                None => Box::new(stream),
+                            };
+                            let mut reader = BufReader::new(&mut io);
+                            let mut first = String::new();
+                            if reader.read_line(&mut first).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let mut parts = first.split_whitespace();
+                            let method = parts.next().unwrap_or("").to_string();
+                            let path = parts.next().unwrap_or("").to_string();
+                            let mut headers = HashMap::new();
+                            loop {
+                                let mut line = String::new();
+                                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                    break;
+                                }
+                                let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+                                if trimmed.is_empty() {
+                                    break;
+                                }
+                                if let Some((k, v)) = trimmed.split_once(':') {
+                                    headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                                }
+                            }
+                            let rec = RecordedRequest { method, path, headers };
+                            reqs.lock().await.push(rec.clone());
+                            let resp = handler(&rec);
+                            let reason = match resp.status {
+                                200 => "OK",
+                                302 => "Found",
+                                307 => "Temporary Redirect",
+                                401 => "Unauthorized",
+                                404 => "Not Found",
+                                _ => "Status",
+                            };
+                            let mut head = format!(
+                                "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                resp.status,
+                                reason,
+                                resp.body.len()
+                            );
+                            for (k, v) in resp.headers {
+                                head.push_str(&format!("{k}: {v}\r\n"));
+                            }
+                            head.push_str("\r\n");
+                            let inner = reader.into_inner();
+                            let _ = inner.write_all(head.as_bytes()).await;
+                            let _ = inner.write_all(&resp.body).await;
+                            let _ = inner.shutdown().await;
+                        });
+                    }
+                }
+            }
+        });
+
+        MockHttpServer {
+            port,
+            requests,
+            shutdown,
+        }
+    }
+
+    trait AsyncReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
+    impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite> AsyncReadWrite for T {}
+
+    fn minimal_image_fixtures() -> (String, String, String, Vec<u8>, String, String) {
+        let layer_bytes = b"mock-layer-bytes".to_vec();
+        let layer_digest = sha256_digest(&layer_bytes).to_string();
+        let config_json = format!(
+            r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":["{layer_digest}"]}}}}"#
+        );
+        let config_digest = sha256_digest(config_json.as_bytes()).to_string();
+        let manifest_json = format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{layer_digest}","size":{}}}]}}"#,
+            config_json.len(),
+            layer_bytes.len()
+        );
+        let manifest_digest = sha256_digest(manifest_json.as_bytes()).to_string();
+        (
+            manifest_json,
+            manifest_digest,
+            config_json,
+            layer_bytes,
+            config_digest,
+            layer_digest,
+        )
+    }
+
+    #[tokio::test]
+    async fn tls_registry_rejects_untrusted_certificate_by_default() {
+        let server = spawn_mock_server(true, |_| MockHttpResponse::json(200, "{}")).await;
+        let registry = format!("127.0.0.1:{}", server.port);
+        let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+        let client = RegistryClient::with_options(
+            Credentials::default(),
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                registry_hosts: vec![registry],
+                skip_tls_verify: false,
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(client.pull_base(&reference).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn tls_registry_pull_and_bearer_auth_succeed_when_configured() {
+        let (manifest_json, manifest_digest, config_json, layer_bytes, config_digest, layer_digest) =
+            minimal_image_fixtures();
+        let port_holder = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let port_ref = port_holder.clone();
+        let server = spawn_mock_server(true, move |req| {
+            let port = port_ref.load(Ordering::Relaxed);
+            match req.path.as_str() {
+                "/v2/" => {
+                    if !req.headers.contains_key("authorization") {
+                        MockHttpResponse {
+                            status: 401,
+                            headers: vec![(
+                                "WWW-Authenticate".into(),
+                                format!(
+                                    r#"Bearer realm="https://127.0.0.1:{port}/token",service="reg""#
+                                ),
+                            )],
+                            body: Vec::new(),
+                        }
+                    } else {
+                        MockHttpResponse::json(200, "{}")
+                    }
+                }
+                p if p.starts_with("/token") => {
+                    assert_eq!(
+                        req.headers.get("authorization").map(String::as_str),
+                        Some("Basic YWxpY2U6c2VjcmV0")
+                    );
+                    MockHttpResponse::json(200, r#"{"token":"tok-123"}"#)
+                }
+                "/v2/test/app/manifests/v1" => MockHttpResponse {
+                    status: 200,
+                    headers: vec![
+                        (
+                            "Content-Type".into(),
+                            "application/vnd.oci.image.manifest.v1+json".into(),
+                        ),
+                        ("Docker-Content-Digest".into(), manifest_digest.clone()),
+                    ],
+                    body: manifest_json.as_bytes().to_vec(),
+                },
+                p if p == format!("/v2/test/app/blobs/{config_digest}") => MockHttpResponse::bytes(
+                    200,
+                    "application/json",
+                    config_json.as_bytes().to_vec(),
+                ),
+                p if p == format!("/v2/test/app/blobs/{layer_digest}") => {
+                    MockHttpResponse::bytes(200, "application/octet-stream", layer_bytes.clone())
+                }
+                _ => MockHttpResponse::json(404, "{}"),
+            }
+        })
+        .await;
+        port_holder.store(server.port, Ordering::Relaxed);
+
+        let registry = format!("127.0.0.1:{}", server.port);
+        let creds = Credentials::load(&[format!("{registry}=alice:secret")], None).unwrap();
+        let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+        let client = RegistryClient::with_options(
+            creds,
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                registry_hosts: vec![registry],
+                skip_tls_verify: true,
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+
+        let image = client.pull_base(&reference).await.unwrap();
+        assert_eq!(image.layers.len(), 1);
+        let mut tmp = tempfile::tempfile().unwrap();
+        client
+            .fetch_layer_to_file(&reference, &image.layers[0], &mut tmp, |_| {})
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn token_client_rejects_untrusted_bearer_realm_without_sending_credentials() {
+        let evil = spawn_mock_server(false, |_| {
+            MockHttpResponse::json(200, r#"{"token":"evil"}"#)
+        })
+        .await;
+        let evil_port = evil.port;
+        let reg = spawn_mock_server(false, move |req| {
+            if req.path == "/v2/" {
+                MockHttpResponse {
+                    status: 401,
+                    headers: vec![(
+                        "WWW-Authenticate".into(),
+                        format!(
+                            r#"Bearer realm="http://127.0.0.1:{evil_port}/steal",service="evil""#
+                        ),
+                    )],
+                    body: Vec::new(),
+                }
+            } else {
+                MockHttpResponse::json(404, "{}")
+            }
+        })
+        .await;
+
+        let registry = format!("127.0.0.1:{}", reg.port);
+        let creds = Credentials::load(&[format!("{registry}=alice:supersecret")], None).unwrap();
+        let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+        let client = RegistryClient::with_options(
+            creds,
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                plain_http_hosts: vec![registry.clone()],
+                registry_hosts: vec![registry],
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+
+        let err = client.pull_base(&reference).await.unwrap_err().to_string();
+        assert!(err.contains("pulling manifest+config"), "got: {err}");
+        assert!(
+            evil.requests.lock().await.is_empty(),
+            "credentials must NEVER be sent to untrusted realm"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_client_allows_explicit_auth_host_and_blocks_redirects() {
+        let evil = spawn_mock_server(false, |_| {
+            MockHttpResponse::json(200, r#"{"token":"evil"}"#)
+        })
+        .await;
+        let evil_port = evil.port;
+        let auth_srv = spawn_mock_server(false, move |req| {
+            if req.path.contains("redirect=1") {
+                MockHttpResponse {
+                    status: 302,
+                    headers: vec![(
+                        "Location".into(),
+                        format!("http://127.0.0.1:{evil_port}/steal"),
+                    )],
+                    body: Vec::new(),
+                }
+            } else {
+                MockHttpResponse::json(200, r#"{"token":"allowed-tok"}"#)
+            }
+        })
+        .await;
+        let auth_port = auth_srv.port;
+        let reg = spawn_mock_server(false, move |req| {
+            if req.path == "/v2/" {
+                MockHttpResponse {
+                    status: 401,
+                    headers: vec![(
+                        "WWW-Authenticate".into(),
+                        format!(
+                            r#"Bearer realm="http://127.0.0.1:{auth_port}/token?redirect=1",service="ext""#
+                        ),
+                    )],
+                    body: Vec::new(),
+                }
+            } else {
+                MockHttpResponse::json(404, "{}")
+            }
+        })
+        .await;
+
+        let registry = format!("127.0.0.1:{}", reg.port);
+        let auth_host = format!("127.0.0.1:{auth_port}");
+        let creds = Credentials::load(&[format!("{registry}=alice:supersecret")], None).unwrap();
+        let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+        let client = RegistryClient::with_options(
+            creds,
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                plain_http_hosts: vec![registry.clone()],
+                registry_hosts: vec![registry],
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allowed_auth_hosts: vec![auth_host],
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(client.pull_base(&reference).await.is_err());
+        assert!(
+            evil.requests.lock().await.is_empty(),
+            "TokenClient must not follow 302 redirects"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_blocks_localhost_by_default() {
+        let server = spawn_mock_server(false, |_| MockHttpResponse::json(200, "{}")).await;
+        let registry = format!("127.0.0.1:{}", server.port);
+        let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+        let client = RegistryClient::with_options(
+            Credentials::default(),
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                plain_http_hosts: vec![registry.clone()],
+                registry_hosts: vec![registry],
+                max_attempts: 1,
+                network_policy: NetworkPolicy::default(), // allow_private_network = false
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(client.pull_base(&reference).await.is_err());
+        assert!(
+            server.requests.lock().await.is_empty(),
+            "loopback registry must be blocked before connecting"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_blocks_https_to_http_downgrade_redirect_and_metadata_redirect() {
+        let evil = spawn_mock_server(false, |_| {
+            MockHttpResponse::bytes(200, "application/octet-stream", b"x".to_vec())
+        })
+        .await;
+        let evil_port = evil.port;
+        let (manifest_json, manifest_digest, config_json, _, config_digest, layer_digest) =
+            minimal_image_fixtures();
+        let reg = spawn_mock_server(true, move |req| match req.path.as_str() {
+            "/v2/" => MockHttpResponse::json(200, "{}"),
+            "/v2/test/app/manifests/v1" => MockHttpResponse {
+                status: 200,
+                headers: vec![
+                    (
+                        "Content-Type".into(),
+                        "application/vnd.oci.image.manifest.v1+json".into(),
+                    ),
+                    ("Docker-Content-Digest".into(), manifest_digest.clone()),
+                ],
+                body: manifest_json.as_bytes().to_vec(),
+            },
+            p if p == format!("/v2/test/app/blobs/{config_digest}") => {
+                MockHttpResponse::bytes(200, "application/json", config_json.as_bytes().to_vec())
+            }
+            p if p == format!("/v2/test/app/blobs/{layer_digest}") => MockHttpResponse {
+                status: 307,
+                headers: vec![(
+                    "Location".into(),
+                    format!("http://127.0.0.1:{evil_port}/downgrade"),
+                )],
+                body: Vec::new(),
+            },
+            _ => MockHttpResponse::json(404, "{}"),
+        })
+        .await;
+
+        let registry = format!("127.0.0.1:{}", reg.port);
+        let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+        let client = RegistryClient::with_options(
+            Credentials::default(),
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                registry_hosts: vec![registry],
+                skip_tls_verify: true,
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+
+        let image = client.pull_base(&reference).await.unwrap();
+        let mut tmp = tempfile::tempfile().unwrap();
+        assert!(
+            client
+                .fetch_layer_to_file(&reference, &image.layers[0], &mut tmp, |_| {})
+                .await
+                .is_err()
+        );
+        assert!(
+            evil.requests.lock().await.is_empty(),
+            "HTTPS->HTTP downgrade redirect must be blocked by proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_descriptor_urls_are_ignored_unless_allow_blob_host_is_set() {
+        let layer_bytes = b"external-blob-payload".to_vec();
+        let layer_digest = sha256_digest(&layer_bytes);
+        let ext = spawn_mock_server(false, move |_| {
+            MockHttpResponse::bytes(200, "application/octet-stream", layer_bytes.clone())
+        })
+        .await;
+        let reg = spawn_mock_server(false, |_| MockHttpResponse::json(404, "{}")).await;
+        let registry = format!("127.0.0.1:{}", reg.port);
+        let ext_host = format!("127.0.0.1:{}", ext.port);
+        let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+        let descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageLayer)
+            .digest(layer_digest)
+            .size(21_u64)
+            .urls(vec![format!("http://{ext_host}/blob")])
+            .build()
+            .unwrap();
+
+        // Without allow_blob_hosts: external URL must not be contacted.
+        let strict_client = RegistryClient::with_options(
+            Credentials::default(),
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                plain_http_hosts: vec![registry.clone()],
+                registry_hosts: vec![registry.clone()],
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+        let mut tmp = tempfile::tempfile().unwrap();
+        assert!(
+            strict_client
+                .fetch_layer_to_file(&reference, &descriptor, &mut tmp, |_| {})
+                .await
+                .is_err()
+        );
+        assert!(ext.requests.lock().await.is_empty());
+
+        // With allow_blob_hosts: external URL succeeds and verifies digest.
+        let allowed_client = RegistryClient::with_options(
+            Credentials::default(),
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                plain_http_hosts: vec![registry.clone(), ext_host.clone()],
+                registry_hosts: vec![registry],
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allowed_blob_hosts: vec![ext_host],
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+        allowed_client
+            .fetch_layer_to_file(&reference, &descriptor, &mut tmp, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(ext.requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cdn_redirect_across_hosts_succeeds_without_leaking_credentials() {
+        let (manifest_json, manifest_digest, config_json, layer_bytes, config_digest, layer_digest) =
+            minimal_image_fixtures();
+        let cdn = spawn_mock_server(false, move |_| {
+            MockHttpResponse::bytes(200, "application/octet-stream", layer_bytes.clone())
+        })
+        .await;
+        let cdn_port = cdn.port;
+        let reg_port_holder = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let reg_port_ref = reg_port_holder.clone();
+        let reg = spawn_mock_server(false, move |req| {
+            let reg_port = reg_port_ref.load(Ordering::Relaxed);
+            match req.path.as_str() {
+                "/v2/" => {
+                    if !req.headers.contains_key("authorization") {
+                        MockHttpResponse {
+                            status: 401,
+                            headers: vec![(
+                                "WWW-Authenticate".into(),
+                                format!(
+                                    r#"Bearer realm="http://127.0.0.1:{reg_port}/token",service="reg""#
+                                ),
+                            )],
+                            body: Vec::new(),
+                        }
+                    } else {
+                        MockHttpResponse::json(200, "{}")
+                    }
+                }
+                p if p.starts_with("/token") => {
+                    MockHttpResponse::json(200, r#"{"token":"secret-bearer"}"#)
+                }
+                "/v2/test/app/manifests/v1" => MockHttpResponse {
+                    status: 200,
+                    headers: vec![
+                        (
+                            "Content-Type".into(),
+                            "application/vnd.oci.image.manifest.v1+json".into(),
+                        ),
+                        ("Docker-Content-Digest".into(), manifest_digest.clone()),
+                    ],
+                    body: manifest_json.as_bytes().to_vec(),
+                },
+                p if p == format!("/v2/test/app/blobs/{config_digest}") => {
+                    MockHttpResponse::bytes(200, "application/json", config_json.as_bytes().to_vec())
+                }
+                p if p == format!("/v2/test/app/blobs/{layer_digest}") => MockHttpResponse {
+                    status: 307,
+                    headers: vec![(
+                        "Location".into(),
+                        format!("http://127.0.0.1:{cdn_port}/cdn-blob"),
+                    )],
+                    body: Vec::new(),
+                },
+                _ => MockHttpResponse::json(404, "{}"),
+            }
+        })
+        .await;
+        reg_port_holder.store(reg.port, Ordering::Relaxed);
+
+        let registry = format!("127.0.0.1:{}", reg.port);
+        let cdn_host = format!("127.0.0.1:{cdn_port}");
+        let creds = Credentials::load(&[format!("{registry}=alice:secret")], None).unwrap();
+        let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+        let client = RegistryClient::with_options(
+            creds,
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                plain_http_hosts: vec![registry.clone(), cdn_host],
+                registry_hosts: vec![registry],
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+
+        let image = client.pull_base(&reference).await.unwrap();
+        let mut tmp = tempfile::tempfile().unwrap();
+        client
+            .fetch_layer_to_file(&reference, &image.layers[0], &mut tmp, |_| {})
+            .await
+            .unwrap();
+
+        let cdn_reqs = cdn.requests.lock().await;
+        assert_eq!(cdn_reqs.len(), 1);
+        assert!(
+            !cdn_reqs[0].headers.contains_key("authorization"),
+            "CDN redirect must not leak registry Authorization header"
+        );
     }
 }

@@ -13,15 +13,20 @@ pub async fn run() -> Result<()> {
     let cli = parse();
     let progress = Progress::new(cli.global.progress);
     runtime::init_tracing(&progress);
-    let credentials =
-        Credentials::load(&cli.global.credential, cli.global.docker_config.as_deref())?;
 
     match cli.command {
         Command::Build(arguments) => {
             let specification = spec::ImageBuildSpec::try_from(*arguments)?;
-            spec::BuildRequest::try_from(specification)?
-                .run(credentials, progress)
-                .await
+            let request = spec::BuildRequest::try_from(specification)?;
+            let credentials = if request.needs_registry_access()
+                || cli.global.docker_config.is_some()
+                || !cli.global.credential.is_empty()
+            {
+                Credentials::load(&cli.global.credential, cli.global.docker_config.as_deref())?
+            } else {
+                Credentials::default()
+            };
+            request.run(credentials, progress).await
         }
     }
 }
