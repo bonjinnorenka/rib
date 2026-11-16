@@ -1,0 +1,136 @@
+name: GHCR authenticated push/pull smoke (Dockerless)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ghcr:
+    name: GHCR push with rib; independent skopeo pull
+    if: github.repository == 'bonjinnorenka/rib' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout without persisting credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.94.0
+      - name: Build standalone rib before obtaining a package token
+        run: cargo build --release --locked --bin rib
+      - name: Install independent registry client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends skopeo
+      - name: GHCR push, separate pull and digest verification
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          export DOCKER_CONFIG="$RUNNER_TEMP/rib-ghcr-auth"
+          mkdir -p "$DOCKER_CONFIG"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          python3 - <<'PY'
+          import base64, json, os
+          from pathlib import Path
+          username = os.environ["GITHUB_ACTOR"]
+          token = os.environ["GHCR_TOKEN"]
+          if not token:
+              raise RuntimeError("GITHUB_TOKEN missing")
+          auth = base64.b64encode(f"{username}:{token}".encode()).decode()
+          dest = Path(os.environ["DOCKER_CONFIG"]) / "config.json"
+          dest.write_text(json.dumps({"auths":{"ghcr.io":{"auth":auth}}}))
+          dest.chmod(0o600)
+          PY
+
+          fixture="$RUNNER_TEMP/rib-ghcr-fixture"
+          mkdir -p "$fixture"
+          printf 'rib-ghcr-auth-smoke-v1\n' > "$fixture/payload.txt"
+          image="ghcr.io/bonjinnorenka/rib-ci-smoke:ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          export RIB_TEST_IMAGE="$image"
+          export RIB_LOCAL_ARCHIVE="$RUNNER_TEMP/rib-local.tar"
+          export RIB_PULLED_ARCHIVE="$RUNNER_TEMP/rib-pulled.tar"
+          export RIB_REMOTE_MANIFEST="$RUNNER_TEMP/manifest-remote.json"
+          unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+
+          ./target/release/rib build \
+            --from scratch \
+            --to "oci-archive:$RIB_LOCAL_ARCHIVE@smoke" \
+            --to "registry:$image" \
+            --allow-registry ghcr.io \
+            --allow-auth-host ghcr.io \
+            --copy-root "$fixture" \
+            --copy "$fixture/payload.txt:/app/payload.txt,mode=0644,chown=65532:65532" \
+            --label "org.opencontainers.image.source=https://github.com/bonjinnorenka/rib" \
+            --user 65532:65532 \
+            --workdir /app \
+            --creation-time epoch \
+            --max-attempts 2 \
+            --transfer-timeout 120 \
+            --max-blob-size 16MiB \
+            --max-total-download 32MiB \
+            --max-decompressed-size 32MiB
+
+          skopeo inspect --raw --authfile "$DOCKER_CONFIG/config.json" "docker://$image" > "$RIB_REMOTE_MANIFEST"
+          skopeo copy --src-authfile "$DOCKER_CONFIG/config.json" \
+            "docker://$image" "oci-archive:$RIB_PULLED_ARCHIVE:smoke"
+
+          python3 - <<'PY'
+          import gzip, hashlib, io, json, os, tarfile
+          from pathlib import Path
+
+          def sha(data):
+              return "sha256:" + hashlib.sha256(data).hexdigest()
+
+          def check(path):
+              with tarfile.open(path, "r:") as archive:
+                  index = json.load(archive.extractfile("index.json"))
+                  assert index["schemaVersion"] == 2 and len(index["manifests"]) == 1
+                  manifest_descriptor = index["manifests"][0]
+                  def blob(desc):
+                      digest = desc["digest"]
+                      algorithm, encoded = digest.split(":", 1)
+                      assert algorithm == "sha256"
+                      raw = archive.extractfile("blobs/sha256/" + encoded).read()
+                      assert sha(raw) == digest
+                      assert len(raw) == desc["size"]
+                      return raw
+                  manifest_raw = blob(manifest_descriptor)
+                  manifest = json.loads(manifest_raw)
+                  config = json.loads(blob(manifest["config"]))
+                  assert config["config"]["Labels"]["org.opencontainers.image.source"] == "https://github.com/bonjinnorenka/rib"
+                  assert config["config"]["User"] == "65532:65532"
+                  assert config["config"]["WorkingDir"] == "/app"
+                  assert len(manifest["layers"]) == 1
+                  layer_desc = manifest["layers"][0]
+                  layer_bytes = blob(layer_desc)
+                  if layer_desc["mediaType"].endswith("+gzip"):
+                      raw = gzip.decompress(layer_bytes)
+                  elif layer_desc["mediaType"].endswith(".tar"):
+                      raw = layer_bytes
+                  else:
+                      raise AssertionError("unknown layer encoding: " + layer_desc["mediaType"])
+                  assert config["rootfs"]["diff_ids"] == [sha(raw)]
+                  with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as t:
+                      files = {m.name.lstrip("./"): m for m in t.getmembers()}
+                      item = files["app/payload.txt"]
+                      assert item.isfile() and item.mode & 0o777 == 0o644
+                      assert (item.uid, item.gid) == (65532, 65532)
+                      assert t.extractfile(item).read() == b"rib-ghcr-auth-smoke-v1\n"
+                  return manifest_descriptor["digest"]
+
+          local = check(os.environ["RIB_LOCAL_ARCHIVE"])
+          pulled = check(os.environ["RIB_PULLED_ARCHIVE"])
+          remote = sha(Path(os.environ["RIB_REMOTE_MANIFEST"]).read_bytes())
+          assert local == remote == pulled, (local, remote, pulled)
+          print("PASS: authenticated GHCR push, independent skopeo pull, OCI digests/diff_ids and contents")
+          print("Image:", os.environ["RIB_TEST_IMAGE"], "manifest:", remote)
+          PY
