@@ -46,6 +46,7 @@ impl TokenClient {
                 .connect_timeout(options.connect_timeout)
                 .read_timeout(options.read_timeout)
                 .dns_resolver(resolver)
+                .pool_max_idle_per_host(0)
                 .no_proxy()
                 .user_agent(concat!(
                     env!("CARGO_PKG_NAME"),

@@ -1,10 +1,14 @@
 //! Network destination policy, SSRF protection, DNS validation, and local validating proxy.
 
 use std::collections::HashSet;
+#[cfg(test)]
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -30,7 +34,7 @@ pub struct NetworkPolicy {
     pub allowed_auth_hosts: Vec<String>,
     /// If non-empty, permits external descriptor `urls` from matching hosts and
     /// restricts CDN/redirect hosts to `allowed_registries` / registry hosts +
-    /// `allowed_blob_hosts` + `allowed_auth_hosts`.
+    /// `allowed_blob_hosts`.
     pub allowed_blob_hosts: Vec<String>,
     /// Allow loopback and RFC1918/ULA private IPs (for local test registries).
     /// Link-local and cloud metadata addresses remain blocked regardless.
@@ -77,6 +81,7 @@ impl NetworkPolicy {
         url: &Url,
         allow_plain_http_for_registry: bool,
     ) -> Result<()> {
+        self.check_registry_host(registry)?;
         if !url.username().is_empty() || url.password().is_some() {
             bail!("authentication URL must not embed credentials");
         }
@@ -179,23 +184,15 @@ impl NetworkPolicy {
                 .with_context(|| format!("target {host}:{port} uses blocked IP {ip}"))?;
         }
         let default_port = if is_plain_http { 80 } else { 443 };
-        if !self.allowed_blob_hosts.is_empty() {
-            let allowed =
-                matches_any_host_pattern(&self.allowed_blob_hosts, host, Some(port), default_port)
-                    || matches_any_host_pattern(
-                        &self.allowed_registries,
-                        host,
-                        Some(port),
-                        default_port,
-                    )
-                    || matches_any_host_pattern(
-                        &self.allowed_auth_hosts,
-                        host,
-                        Some(port),
-                        default_port,
-                    )
-                    || host_matches_list(registry_hosts, host, port, default_port);
-            if !allowed {
+        if !self.allowed_registries.is_empty() || !self.allowed_blob_hosts.is_empty() {
+            let allowed_as_registry = if !self.allowed_registries.is_empty() {
+                matches_any_host_pattern(&self.allowed_registries, host, Some(port), default_port)
+            } else {
+                host_matches_list(registry_hosts, host, port, default_port)
+            };
+            let allowed_as_blob =
+                matches_any_host_pattern(&self.allowed_blob_hosts, host, Some(port), default_port);
+            if !allowed_as_registry && !allowed_as_blob {
                 bail!("outbound target {host}:{port} is not in allowed registry/blob hosts");
             }
         }
@@ -357,8 +354,16 @@ pub fn check_blocked_hostname(host: &str, allow_private_network: bool) -> Result
     }
     if matches!(
         normalized.as_str(),
-        "metadata.google.internal" | "metadata.goog" | "metadata" | "instance-data"
+        "metadata"
+            | "metadata.google.internal"
+            | "metadata.goog"
+            | "instance-data"
+            | "instance-data.ec2.internal"
+            | "metadata.azure.com"
     ) || normalized.ends_with(".metadata.google.internal")
+        || normalized.ends_with(".metadata.goog")
+        || normalized.ends_with(".instance-data.ec2.internal")
+        || normalized.ends_with(".metadata.azure.com")
     {
         bail!("access to cloud metadata hostname {host:?} is forbidden");
     }
@@ -389,11 +394,15 @@ pub fn check_ip(ip: IpAddr, allow_private_network: bool) -> Result<()> {
 fn check_ipv4(v4: Ipv4Addr, allow_private_network: bool) -> Result<()> {
     let octets = v4.octets();
     // Always block unspecified (0.0.0.0/8), link-local / cloud metadata (169.254.0.0/16),
+    // Alibaba Cloud metadata (100.100.100.200), Azure WireServer (168.63.129.16),
     // multicast (224.0.0.0/4), and reserved/broadcast (240.0.0.0/4).
     if octets[0] == 0 {
         bail!("unspecified IPv4 address {v4} is forbidden");
     }
-    if v4.is_link_local() {
+    if v4.is_link_local()
+        || v4 == Ipv4Addr::new(100, 100, 100, 200)
+        || v4 == Ipv4Addr::new(168, 63, 129, 16)
+    {
         bail!("link-local/metadata IPv4 address {v4} is forbidden");
     }
     if v4.is_multicast() || octets[0] >= 240 {
@@ -442,8 +451,8 @@ fn check_ipv6(v6: Ipv6Addr, allow_private_network: bool) -> Result<()> {
     {
         bail!("reserved IPv6 address {v6} is forbidden");
     }
-    // AWS IPv6 metadata fd00:ec2::254 is always forbidden even when private networks are allowed
-    if segments == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254] {
+    // AWS IPv6 metadata / local service prefix fd00:ec2::/32 (includes fd00:ec2::254)
+    if segments[0] == 0xfd00 && segments[1] == 0x0ec2 {
         bail!("cloud metadata IPv6 address {v6} is forbidden");
     }
     if !allow_private_network {
@@ -462,6 +471,42 @@ fn check_ipv6(v6: Ipv6Addr, allow_private_network: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+type TestDnsMap = HashMap<String, VecDeque<Vec<IpAddr>>>;
+
+#[cfg(test)]
+fn test_dns_overrides() -> &'static Mutex<TestDnsMap> {
+    static OVERRIDES: OnceLock<Mutex<TestDnsMap>> = OnceLock::new();
+    OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(super) struct TestDnsOverrideGuard {
+    key: String,
+}
+
+#[cfg(test)]
+impl Drop for TestDnsOverrideGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = test_dns_overrides().lock() {
+            map.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn set_test_dns_override(
+    host: &str,
+    responses: Vec<Vec<IpAddr>>,
+) -> TestDnsOverrideGuard {
+    let key = strip_ipv6_brackets(host)
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let mut map = test_dns_overrides().lock().unwrap();
+    map.insert(key.clone(), responses.into_iter().collect());
+    TestDnsOverrideGuard { key }
+}
+
 pub async fn resolve_and_validate(
     host: &str,
     port: u16,
@@ -474,6 +519,31 @@ pub async fn resolve_and_validate(
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
+    #[cfg(test)]
+    let resolved: Vec<SocketAddr> = {
+        let key = clean_host.trim_end_matches('.').to_ascii_lowercase();
+        let override_ips = {
+            let mut map = test_dns_overrides().lock().unwrap();
+            map.get_mut(&key).map(|queue| {
+                if queue.len() > 1 {
+                    queue.pop_front().unwrap()
+                } else {
+                    queue.front().cloned().unwrap_or_default()
+                }
+            })
+        };
+        if let Some(ips) = override_ips {
+            ips.into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect()
+        } else {
+            tokio::net::lookup_host((clean_host, port))
+                .await
+                .with_context(|| format!("resolving {clean_host}:{port}"))?
+                .collect()
+        }
+    };
+    #[cfg(not(test))]
     let resolved: Vec<SocketAddr> = tokio::net::lookup_host((clean_host, port))
         .await
         .with_context(|| format!("resolving {clean_host}:{port}"))?
@@ -799,16 +869,22 @@ mod tests {
             "172.16.0.1",
             "192.168.1.1",
             "100.64.0.1",
+            "100.100.100.200",
+            "168.63.129.16",
             "169.254.169.254",
             "0.0.0.0",
             "224.0.0.1",
             "::1",
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
+            "::ffff:100.100.100.200",
+            "::ffff:168.63.129.16",
+            "::100.100.100.200",
             "::ffff:10.0.0.1",
             "fe80::1",
             "fc00::1",
             "fd00:ec2::254",
+            "fd00:ec2::1",
         ] {
             let parsed: IpAddr = ip.parse().unwrap();
             assert!(
@@ -825,14 +901,22 @@ mod tests {
         }
         assert!(check_ip("127.0.0.1".parse().unwrap(), true).is_ok());
         assert!(check_ip("10.0.0.1".parse().unwrap(), true).is_ok());
+        assert!(check_ip("192.168.1.1".parse().unwrap(), true).is_ok());
+        assert!(check_ip("100.64.0.1".parse().unwrap(), true).is_ok());
         assert!(check_ip("::1".parse().unwrap(), true).is_ok());
 
         for always_blocked in [
             "169.254.169.254",
             "169.254.0.1",
+            "100.100.100.200",
+            "168.63.129.16",
             "::ffff:169.254.169.254",
+            "::ffff:100.100.100.200",
+            "::ffff:168.63.129.16",
+            "::100.100.100.200",
             "fe80::1",
             "fd00:ec2::254",
+            "fd00:ec2::1",
             "0.0.0.0",
         ] {
             assert!(
@@ -844,12 +928,33 @@ mod tests {
 
     #[test]
     fn hostname_policy_blocks_metadata_and_localhost() {
-        assert!(check_blocked_hostname("metadata.google.internal", false).is_err());
-        assert!(check_blocked_hostname("metadata.google.internal.", true).is_err());
-        assert!(check_blocked_hostname("metadata", true).is_err());
+        for meta in [
+            "metadata.google.internal",
+            "metadata.google.internal.",
+            "sub.metadata.google.internal",
+            "metadata.goog",
+            "sub.metadata.goog",
+            "metadata",
+            "instance-data",
+            "instance-data.ec2.internal",
+            "sub.instance-data.ec2.internal",
+            "metadata.azure.com",
+            "sub.metadata.azure.com",
+        ] {
+            assert!(
+                check_blocked_hostname(meta, false).is_err(),
+                "expected {meta} blocked when allow_private_network=false"
+            );
+            assert!(
+                check_blocked_hostname(meta, true).is_err(),
+                "expected {meta} blocked when allow_private_network=true"
+            );
+        }
         assert!(check_blocked_hostname("localhost", false).is_err());
         assert!(check_blocked_hostname("sub.localhost", false).is_err());
         assert!(check_blocked_hostname("localhost", true).is_ok());
+        assert!(check_blocked_hostname("ghcr.io", false).is_ok());
+        assert!(check_blocked_hostname("registry.internal.corp", true).is_ok());
     }
 
     #[test]
@@ -950,5 +1055,149 @@ mod tests {
                 .is_ok()
         );
         assert!(good.check_registry_host("evil.example").is_err());
+    }
+
+    #[test]
+    fn proxy_target_enforces_allow_registry_even_without_allow_blob_hosts() {
+        let policy = NetworkPolicy {
+            allowed_registries: vec!["reg.example".to_string()],
+            ..NetworkPolicy::default()
+        };
+        let registry_hosts = vec!["reg.example".to_string()];
+
+        assert!(
+            policy
+                .check_proxy_target("reg.example", 443, false, &[], &registry_hosts)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check_proxy_target("evil.example", 443, false, &[], &registry_hosts)
+                .is_err(),
+            "public HTTPS target not in --allow-registry must be rejected"
+        );
+        // Even if registry_hosts somehow contained another entry, --allow-registry wins.
+        let mismatched = vec!["other.example".to_string()];
+        assert!(
+            policy
+                .check_proxy_target("other.example", 443, false, &[], &mismatched)
+                .is_err(),
+            "--allow-registry must override fallback registry_hosts"
+        );
+    }
+
+    #[test]
+    fn proxy_target_and_auth_destination_distinguish_registry_auth_and_blob_roles() {
+        let policy = NetworkPolicy {
+            allowed_registries: vec!["reg.example".to_string()],
+            allowed_auth_hosts: vec!["auth.example".to_string()],
+            allowed_blob_hosts: vec!["cdn.example".to_string()],
+            ..NetworkPolicy::default()
+        };
+        let registry_hosts = vec!["reg.example".to_string()];
+
+        // Proxy permits registry and blob hosts, never auth-only hosts.
+        assert!(
+            policy
+                .check_proxy_target("reg.example", 443, false, &[], &registry_hosts)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check_proxy_target("cdn.example", 443, false, &[], &registry_hosts)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check_proxy_target("auth.example", 443, false, &[], &registry_hosts)
+                .is_err(),
+            "auth host must not be reachable via proxy as registry/blob host"
+        );
+        assert!(
+            policy
+                .check_proxy_target("evil.example", 443, false, &[], &registry_hosts)
+                .is_err()
+        );
+
+        // Auth destination permits auth host for allowed registry, rejects blob host and unallowed registry.
+        assert!(
+            policy
+                .check_auth_destination(
+                    "reg.example",
+                    &Url::parse("https://auth.example/token").unwrap(),
+                    false
+                )
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check_auth_destination(
+                    "reg.example",
+                    &Url::parse("https://cdn.example/token").unwrap(),
+                    false
+                )
+                .is_err(),
+            "blob host must not be accepted as auth destination"
+        );
+        assert!(
+            policy
+                .check_auth_destination(
+                    "evil.example",
+                    &Url::parse("https://auth.example/token").unwrap(),
+                    false
+                )
+                .is_err(),
+            "unallowed registry must fail check_auth_destination"
+        );
+    }
+
+    #[test]
+    fn proxy_target_rejects_metadata_ips_even_when_allow_private_network_is_true() {
+        let policy = NetworkPolicy {
+            allow_private_network: true,
+            ..NetworkPolicy::default()
+        };
+        for meta in ["100.100.100.200", "168.63.129.16", "169.254.169.254"] {
+            assert!(
+                policy
+                    .check_proxy_target(meta, 443, false, &[], &[])
+                    .is_err(),
+                "expected metadata IP {meta} to be blocked in check_proxy_target"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_and_validate_rejects_multi_record_or_rebound_metadata_ips() {
+        let _guard = set_test_dns_override(
+            "unit-rebind.invalid",
+            vec![
+                vec![
+                    "127.0.0.1".parse().unwrap(),
+                    "100.100.100.200".parse().unwrap(),
+                ],
+                vec!["93.184.216.34".parse().unwrap()],
+                vec!["127.0.0.1".parse().unwrap()],
+            ],
+        );
+
+        // Multi-record response containing Alibaba metadata must fail even with allow_private_network=true
+        assert!(
+            resolve_and_validate("unit-rebind.invalid", 443, true)
+                .await
+                .is_err()
+        );
+        // Next resolution returns public IP -> succeeds when allow_private_network=false
+        assert!(
+            resolve_and_validate("unit-rebind.invalid", 443, false)
+                .await
+                .is_ok()
+        );
+        // Rebind to loopback -> fails when allow_private_network=false
+        assert!(
+            resolve_and_validate("unit-rebind.invalid", 443, false)
+                .await
+                .is_err()
+        );
     }
 }

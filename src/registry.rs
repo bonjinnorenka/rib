@@ -124,6 +124,7 @@ impl RegistryClient {
             .connect_timeout(options.connect_timeout)
             .read_timeout(options.read_timeout)
             .dns_resolver(resolver)
+            .pool_max_idle_per_host(0)
             .no_proxy()
             .user_agent(concat!(
                 env!("CARGO_PKG_NAME"),
@@ -188,6 +189,10 @@ impl RegistryClient {
         is_push: bool,
     ) -> oci_client::errors::Result<(Client, RegistryAuth)> {
         let registry = reference.resolve_registry().to_string();
+        self.options
+            .network_policy
+            .check_registry_host(&registry)
+            .map_err(|error| OciDistributionError::AuthenticationFailure(error.to_string()))?;
         let key = (
             registry.clone(),
             reference.repository().to_string(),
@@ -1542,5 +1547,516 @@ seTuix+/DtzfmDHobU29\n\
             !cdn_reqs[0].headers.contains_key("authorization"),
             "CDN redirect must not leak registry Authorization header"
         );
+    }
+
+    #[tokio::test]
+    async fn allow_registry_only_blocks_unallowed_registry_and_redirect_before_connect() {
+        let (manifest_json, manifest_digest, config_json, _, config_digest, layer_digest) =
+            minimal_image_fixtures();
+        let evil = spawn_mock_server(false, |_| {
+            MockHttpResponse::bytes(200, "application/octet-stream", b"evil".to_vec())
+        })
+        .await;
+        let evil_port = evil.port;
+        let reg = spawn_mock_server(false, move |req| match req.path.as_str() {
+            "/v2/" => MockHttpResponse::json(200, "{}"),
+            "/v2/test/app/manifests/v1" => MockHttpResponse {
+                status: 200,
+                headers: vec![
+                    (
+                        "Content-Type".into(),
+                        "application/vnd.oci.image.manifest.v1+json".into(),
+                    ),
+                    ("Docker-Content-Digest".into(), manifest_digest.clone()),
+                ],
+                body: manifest_json.as_bytes().to_vec(),
+            },
+            p if p == format!("/v2/test/app/blobs/{config_digest}") => {
+                MockHttpResponse::bytes(200, "application/json", config_json.as_bytes().to_vec())
+            }
+            p if p == format!("/v2/test/app/blobs/{layer_digest}") => MockHttpResponse {
+                status: 307,
+                headers: vec![(
+                    "Location".into(),
+                    format!("http://127.0.0.1:{evil_port}/blob"),
+                )],
+                body: Vec::new(),
+            },
+            _ => MockHttpResponse::json(404, "{}"),
+        })
+        .await;
+
+        let registry = format!("127.0.0.1:{}", reg.port);
+        let evil_host = format!("127.0.0.1:{evil_port}");
+        let client = RegistryClient::with_options(
+            Credentials::default(),
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                plain_http_hosts: vec![registry.clone(), evil_host.clone()],
+                registry_hosts: vec![registry.clone()],
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allowed_registries: vec![registry.clone()],
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+
+        // Direct pull to an unallowed registry is blocked before connecting.
+        let evil_ref: Reference = format!("{evil_host}/test/app:v1").parse().unwrap();
+        assert!(client.pull_base(&evil_ref).await.is_err());
+        assert!(
+            evil.requests.lock().await.is_empty(),
+            "unallowed registry must be rejected before connecting"
+        );
+
+        // Allowed registry succeeds for manifest/config, but 307 redirect to unallowed host is blocked before connect.
+        let allowed_ref: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+        let image = client.pull_base(&allowed_ref).await.unwrap();
+        let mut tmp = tempfile::tempfile().unwrap();
+        assert!(
+            client
+                .fetch_layer_to_file(&allowed_ref, &image.layers[0], &mut tmp, |_| {})
+                .await
+                .is_err(),
+            "redirect to host outside --allow-registry must be rejected"
+        );
+        assert!(
+            evil.requests.lock().await.is_empty(),
+            "proxy must reject unallowed redirect target before connecting"
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_registry_auth_host_and_cdn_host_work_with_role_separation() {
+        let (manifest_json, manifest_digest, config_json, layer_bytes, config_digest, layer_digest) =
+            minimal_image_fixtures();
+        let cdn = spawn_mock_server(false, move |_| {
+            MockHttpResponse::bytes(200, "application/octet-stream", layer_bytes.clone())
+        })
+        .await;
+        let cdn_port = cdn.port;
+        let auth_srv = spawn_mock_server(false, |req| {
+            if req.path.starts_with("/token") {
+                assert_eq!(
+                    req.headers.get("authorization").map(String::as_str),
+                    Some("Basic YWxpY2U6c2VjcmV0")
+                );
+                MockHttpResponse::json(200, r#"{"token":"role-tok"}"#)
+            } else {
+                MockHttpResponse::json(404, "{}")
+            }
+        })
+        .await;
+        let auth_port = auth_srv.port;
+        let evil = spawn_mock_server(false, |_| {
+            MockHttpResponse::bytes(200, "application/octet-stream", b"evil".to_vec())
+        })
+        .await;
+        let evil_port = evil.port;
+
+        let redirect_mode = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let redirect_mode_srv = redirect_mode.clone();
+        let reg = spawn_mock_server(false, move |req| match req.path.as_str() {
+            "/v2/" => {
+                if !req.headers.contains_key("authorization") {
+                    let realm_port = if redirect_mode_srv.load(Ordering::Relaxed) == 3 {
+                        cdn_port
+                    } else {
+                        auth_port
+                    };
+                    MockHttpResponse {
+                        status: 401,
+                        headers: vec![(
+                            "WWW-Authenticate".into(),
+                            format!(
+                                r#"Bearer realm="http://127.0.0.1:{realm_port}/token",service="reg""#
+                            ),
+                        )],
+                        body: Vec::new(),
+                    }
+                } else {
+                    MockHttpResponse::json(200, "{}")
+                }
+            }
+            "/v2/test/app/manifests/v1" => MockHttpResponse {
+                status: 200,
+                headers: vec![
+                    (
+                        "Content-Type".into(),
+                        "application/vnd.oci.image.manifest.v1+json".into(),
+                    ),
+                    ("Docker-Content-Digest".into(), manifest_digest.clone()),
+                ],
+                body: manifest_json.as_bytes().to_vec(),
+            },
+            p if p == format!("/v2/test/app/blobs/{config_digest}") => {
+                MockHttpResponse::bytes(200, "application/json", config_json.as_bytes().to_vec())
+            }
+            p if p == format!("/v2/test/app/blobs/{layer_digest}") => {
+                let target_port = match redirect_mode_srv.load(Ordering::Relaxed) {
+                    0 => cdn_port,
+                    1 => auth_port,
+                    _ => evil_port,
+                };
+                MockHttpResponse {
+                    status: 307,
+                    headers: vec![(
+                        "Location".into(),
+                        format!("http://127.0.0.1:{target_port}/cdn-blob"),
+                    )],
+                    body: Vec::new(),
+                }
+            }
+            _ => MockHttpResponse::json(404, "{}"),
+        })
+        .await;
+
+        let registry = format!("127.0.0.1:{}", reg.port);
+        let auth_host = format!("127.0.0.1:{auth_port}");
+        let cdn_host = format!("127.0.0.1:{cdn_port}");
+        let evil_host = format!("127.0.0.1:{evil_port}");
+        let creds = Credentials::load(&[format!("{registry}=alice:secret")], None).unwrap();
+        let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+
+        let make_client = || {
+            RegistryClient::with_options(
+                creds.clone(),
+                Platform::from_str("linux/amd64").unwrap(),
+                RegistryOptions {
+                    plain_http_hosts: vec![
+                        registry.clone(),
+                        auth_host.clone(),
+                        cdn_host.clone(),
+                        evil_host.clone(),
+                    ],
+                    registry_hosts: vec![registry.clone()],
+                    max_attempts: 1,
+                    network_policy: NetworkPolicy {
+                        allowed_registries: vec![registry.clone()],
+                        allowed_auth_hosts: vec![auth_host.clone()],
+                        allowed_blob_hosts: vec![cdn_host.clone()],
+                        allow_private_network: true,
+                    },
+                    ..RegistryOptions::default()
+                },
+            )
+            .unwrap()
+        };
+
+        // 1. Valid path: registry + allowed_auth_host + allowed_blob_host succeed.
+        let client = make_client();
+        let image = client.pull_base(&reference).await.unwrap();
+        let mut tmp = tempfile::tempfile().unwrap();
+        client
+            .fetch_layer_to_file(&reference, &image.layers[0], &mut tmp, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(auth_srv.requests.lock().await.len(), 1);
+        assert_eq!(cdn.requests.lock().await.len(), 1);
+        assert!(
+            !cdn.requests.lock().await[0]
+                .headers
+                .contains_key("authorization")
+        );
+
+        // 2. Blob redirect to auth_host must be blocked before connecting to auth_srv.
+        redirect_mode.store(1, Ordering::Relaxed);
+        assert!(
+            client
+                .fetch_layer_to_file(&reference, &image.layers[0], &mut tmp, |_| {})
+                .await
+                .is_err(),
+            "blob redirect to auth-only host must be rejected"
+        );
+        assert_eq!(
+            auth_srv.requests.lock().await.len(),
+            1,
+            "auth_srv must not receive redirected blob request"
+        );
+
+        // 3. Blob redirect to unallowed evil host must be blocked before connecting.
+        redirect_mode.store(2, Ordering::Relaxed);
+        assert!(
+            client
+                .fetch_layer_to_file(&reference, &image.layers[0], &mut tmp, |_| {})
+                .await
+                .is_err()
+        );
+        assert!(evil.requests.lock().await.is_empty());
+
+        // 4. Auth realm pointing to cdn_host must be rejected without sending credentials.
+        redirect_mode.store(3, Ordering::Relaxed);
+        let client2 = make_client();
+        assert!(client2.pull_base(&reference).await.is_err());
+        assert_eq!(
+            cdn.requests.lock().await.len(),
+            1,
+            "cdn must not receive credential token request"
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_rebinding_and_metadata_ip_resolution_are_blocked_before_connect() {
+        let (manifest_json, manifest_digest, config_json, _, config_digest, _) =
+            minimal_image_fixtures();
+        let reg = spawn_mock_server(false, move |req| match req.path.as_str() {
+            "/v2/" => MockHttpResponse::json(200, "{}"),
+            "/v2/test/app/manifests/v1" => MockHttpResponse {
+                status: 200,
+                headers: vec![
+                    (
+                        "Content-Type".into(),
+                        "application/vnd.oci.image.manifest.v1+json".into(),
+                    ),
+                    ("Docker-Content-Digest".into(), manifest_digest.clone()),
+                ],
+                body: manifest_json.as_bytes().to_vec(),
+            },
+            p if p == format!("/v2/test/app/blobs/{config_digest}") => {
+                MockHttpResponse::bytes(200, "application/json", config_json.as_bytes().to_vec())
+            }
+            _ => MockHttpResponse::json(404, "{}"),
+        })
+        .await;
+
+        // Case A: Hostname resolves to [127.0.0.1, 100.100.100.200] -> blocked before connecting.
+        let multi_host = "reg-multi-meta.invalid";
+        let _multi_guard = net_policy::set_test_dns_override(
+            multi_host,
+            vec![vec![
+                "127.0.0.1".parse().unwrap(),
+                "100.100.100.200".parse().unwrap(),
+            ]],
+        );
+        let multi_registry = format!("{multi_host}:{}", reg.port);
+        let multi_ref: Reference = format!("{multi_registry}/test/app:v1").parse().unwrap();
+        let multi_client = RegistryClient::with_options(
+            Credentials::default(),
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                plain_http_hosts: vec![multi_registry.clone()],
+                registry_hosts: vec![multi_registry.clone()],
+                connect_timeout: Duration::from_millis(200),
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allowed_registries: vec![multi_registry],
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+        let multi_err = format!(
+            "{:#}",
+            multi_client.pull_base(&multi_ref).await.unwrap_err()
+        );
+        assert!(
+            multi_err.contains("forbidden") || multi_err.contains("blocked"),
+            "expected policy block for multi-record metadata IP, got: {multi_err}"
+        );
+        assert!(
+            reg.requests.lock().await.is_empty(),
+            "multi-record DNS containing metadata IP must be blocked before connecting"
+        );
+
+        // Case B: TOCTOU DNS rebinding across /v2/ discovery -> proxy manifest fetch.
+        let toctou_host = "reg-toctou-rebind.invalid";
+        let _toctou_guard = net_policy::set_test_dns_override(
+            toctou_host,
+            vec![
+                vec!["127.0.0.1".parse().unwrap()],
+                vec!["100.100.100.200".parse().unwrap()],
+            ],
+        );
+        let toctou_registry = format!("{toctou_host}:{}", reg.port);
+        let toctou_ref: Reference = format!("{toctou_registry}/test/app:v1").parse().unwrap();
+        let toctou_client = RegistryClient::with_options(
+            Credentials::default(),
+            Platform::from_str("linux/amd64").unwrap(),
+            RegistryOptions {
+                plain_http_hosts: vec![toctou_registry.clone()],
+                registry_hosts: vec![toctou_registry.clone()],
+                connect_timeout: Duration::from_millis(200),
+                max_attempts: 1,
+                network_policy: NetworkPolicy {
+                    allowed_registries: vec![toctou_registry],
+                    allow_private_network: true,
+                    ..NetworkPolicy::default()
+                },
+                ..RegistryOptions::default()
+            },
+        )
+        .unwrap();
+        let toctou_err = format!(
+            "{:#}",
+            toctou_client.pull_base(&toctou_ref).await.unwrap_err()
+        );
+        assert!(
+            toctou_err.contains("403")
+                || toctou_err.contains("forbidden")
+                || toctou_err.contains("blocked"),
+            "expected proxy policy rejection on rebound metadata IP, got: {toctou_err}"
+        );
+        let recorded = reg.requests.lock().await;
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].path, "/v2/");
+    }
+
+    #[tokio::test]
+    async fn allow_private_network_still_blocks_cloud_metadata_requests() {
+        for metadata_host in [
+            "100.100.100.200",
+            "168.63.129.16",
+            "169.254.169.254",
+            "metadata.google.internal",
+            "metadata.azure.com",
+            "instance-data.ec2.internal",
+            "instance-data:80",
+            "metadata:80",
+        ] {
+            let reference: Reference = format!("{metadata_host}/test/app:v1").parse().unwrap();
+            let client = RegistryClient::with_options(
+                Credentials::default(),
+                Platform::from_str("linux/amd64").unwrap(),
+                RegistryOptions {
+                    plain_http_hosts: vec![metadata_host.to_string()],
+                    registry_hosts: vec![metadata_host.to_string()],
+                    connect_timeout: Duration::from_millis(200),
+                    max_attempts: 1,
+                    network_policy: NetworkPolicy {
+                        allow_private_network: true,
+                        ..NetworkPolicy::default()
+                    },
+                    ..RegistryOptions::default()
+                },
+            )
+            .unwrap();
+            let err = client.pull_base(&reference).await.unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("forbidden") || msg.contains("blocked"),
+                "expected policy block for {metadata_host}, got: {msg}"
+            );
+        }
+
+        // Also verify IPv6 and IPv4-mapped metadata addresses are blocked when returned by DNS
+        // or via a 307 redirect through ValidatingProxy, even with allow_private_network=true.
+        for (idx, meta_ip) in [
+            "fd00:ec2::254",
+            "::ffff:100.100.100.200",
+            "::ffff:168.63.129.16",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let host = format!("meta-dns-{idx}.invalid");
+            let _guard =
+                net_policy::set_test_dns_override(&host, vec![vec![meta_ip.parse().unwrap()]]);
+            let reference: Reference = format!("{host}/test/app:v1").parse().unwrap();
+            let client = RegistryClient::with_options(
+                Credentials::default(),
+                Platform::from_str("linux/amd64").unwrap(),
+                RegistryOptions {
+                    plain_http_hosts: vec![host.clone()],
+                    registry_hosts: vec![host],
+                    connect_timeout: Duration::from_millis(200),
+                    max_attempts: 1,
+                    network_policy: NetworkPolicy {
+                        allow_private_network: true,
+                        ..NetworkPolicy::default()
+                    },
+                    ..RegistryOptions::default()
+                },
+            )
+            .unwrap();
+            let err = client.pull_base(&reference).await.unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("forbidden") || msg.contains("blocked"),
+                "expected policy block for DNS->{meta_ip}, got: {msg}"
+            );
+        }
+
+        // Verify direct metadata redirects (IPv6, Alibaba, Azure WireServer, single-label DNS)
+        // through ValidatingProxy are blocked even with allow_private_network=true.
+        for (redirect_host, redirect_url) in [
+            (
+                "[fd00:ec2::254]",
+                "http://[fd00:ec2::254]/latest/meta-data/",
+            ),
+            (
+                "100.100.100.200",
+                "http://100.100.100.200/latest/meta-data/",
+            ),
+            (
+                "168.63.129.16",
+                "http://168.63.129.16/machine?comp=goalstate",
+            ),
+            ("instance-data", "http://instance-data/latest/meta-data/"),
+        ] {
+            let (manifest_json, manifest_digest, config_json, _, config_digest, layer_digest) =
+                minimal_image_fixtures();
+            let redirect_url_owned = redirect_url.to_string();
+            let reg = spawn_mock_server(false, move |req| match req.path.as_str() {
+                "/v2/" => MockHttpResponse::json(200, "{}"),
+                "/v2/test/app/manifests/v1" => MockHttpResponse {
+                    status: 200,
+                    headers: vec![
+                        (
+                            "Content-Type".into(),
+                            "application/vnd.oci.image.manifest.v1+json".into(),
+                        ),
+                        ("Docker-Content-Digest".into(), manifest_digest.clone()),
+                    ],
+                    body: manifest_json.as_bytes().to_vec(),
+                },
+                p if p == format!("/v2/test/app/blobs/{config_digest}") => MockHttpResponse::bytes(
+                    200,
+                    "application/json",
+                    config_json.as_bytes().to_vec(),
+                ),
+                p if p == format!("/v2/test/app/blobs/{layer_digest}") => MockHttpResponse {
+                    status: 307,
+                    headers: vec![("Location".into(), redirect_url_owned.clone())],
+                    body: Vec::new(),
+                },
+                _ => MockHttpResponse::json(404, "{}"),
+            })
+            .await;
+            let registry = format!("127.0.0.1:{}", reg.port);
+            let reference: Reference = format!("{registry}/test/app:v1").parse().unwrap();
+            let client = RegistryClient::with_options(
+                Credentials::default(),
+                Platform::from_str("linux/amd64").unwrap(),
+                RegistryOptions {
+                    plain_http_hosts: vec![registry.clone(), redirect_host.to_string()],
+                    registry_hosts: vec![registry],
+                    connect_timeout: Duration::from_millis(200),
+                    max_attempts: 1,
+                    network_policy: NetworkPolicy {
+                        allow_private_network: true,
+                        ..NetworkPolicy::default()
+                    },
+                    ..RegistryOptions::default()
+                },
+            )
+            .unwrap();
+            let image = client.pull_base(&reference).await.unwrap();
+            let mut tmp = tempfile::tempfile().unwrap();
+            let err = client
+                .fetch_layer_to_file(&reference, &image.layers[0], &mut tmp, |_| {})
+                .await
+                .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("403") || msg.contains("forbidden") || msg.contains("blocked"),
+                "expected proxy block for {redirect_url} redirect, got: {msg}"
+            );
+        }
     }
 }
