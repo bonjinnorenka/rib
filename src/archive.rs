@@ -14,7 +14,7 @@ mod tests {
     use std::str::FromStr;
 
     use anyhow::{Result, bail};
-    use oci_spec::image::{ANNOTATION_REF_NAME, ImageIndex};
+    use oci_spec::image::{ANNOTATION_REF_NAME, ImageConfiguration, ImageIndex};
     use serde::Deserialize;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -51,6 +51,10 @@ mod tests {
     }
 
     fn bundle(contents: &[u8]) -> ImageBundle {
+        bundle_with_env(contents, Vec::new())
+    }
+
+    fn bundle_with_env(contents: &[u8], envs: Vec<(String, String)>) -> ImageBundle {
         let base = Image::scratch(&Platform::from_str("linux/amd64").unwrap()).unwrap();
         let sources = TempDir::new().unwrap();
         let source = sources.path().join("payload");
@@ -65,6 +69,7 @@ mod tests {
             entrypoint: None,
             cmd: None,
             labels: BTreeMap::new(),
+            envs,
             ports: vec![],
             workdir: None,
             user: None,
@@ -137,6 +142,42 @@ mod tests {
         assert_eq!(
             descriptor.annotations().as_ref().unwrap()[ANNOTATION_REF_NAME],
             "app:v1"
+        );
+    }
+
+    #[test]
+    fn oci_archive_config_round_trips_environment() {
+        let bundle = bundle_with_env(
+            b"env",
+            vec![
+                ("RUST_LOG".to_string(), "info".to_string()),
+                ("APP_MODE".to_string(), "production".to_string()),
+                ("EMPTY".to_string(), String::new()),
+                ("WITH_EQUALS".to_string(), "a=b".to_string()),
+            ],
+        );
+        let directory = TempDir::new().unwrap();
+        let archive = directory.path().join("image.tar");
+        write_oci_archive(
+            &bundle,
+            &BuiltOnly,
+            &archive,
+            Some("app:v1"),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        let config: ImageConfiguration =
+            serde_json::from_slice(&read_entry(&archive, &blob_path(&bundle.config_digest)))
+                .unwrap();
+        assert_eq!(
+            config.config().as_ref().unwrap().env().as_ref(),
+            Some(&vec![
+                "RUST_LOG=info".to_string(),
+                "APP_MODE=production".to_string(),
+                "EMPTY=".to_string(),
+                "WITH_EQUALS=a=b".to_string(),
+            ])
         );
     }
 

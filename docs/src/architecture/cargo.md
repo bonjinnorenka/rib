@@ -105,6 +105,7 @@ CLI не предоставляет отдельного режима замен
 | `entrypoint` | Строка или массив строк; `[destination]` | OCI Entrypoint. Примеры: `"/taskd --log-format json"` или `["/taskd", "--log-format", "json"]`. При замене Entrypoint унаследованный Cmd удаляется, если не заданы `cmd` или `keep-cmd = true`. |
 | `cmd` | Строка или массив строк; явно не задаётся | OCI Cmd. Примеры: `"serve --port 8080"` или `["serve", "--port", "8080"]`. Явное значение заменяет Cmd базового образа. |
 | `labels` | Массив строк; `[]` | Метки в формате `key=value`, например `["org.opencontainers.image.title=taskd", "org.opencontainers.image.version=1.0.0"]`. Они объединяются с метками базового образа; одинаковый ключ перезаписывается. |
+| `env` | Массив строк; `[]` | Переменные окружения в формате `KEY=VALUE`, например `["RUST_LOG=info", "APP_MODE=production"]`. Они объединяются с `Env` базового образа; при повторении ключа остаётся последнее значение. Значения из CLI применяются после metadata. |
 | `ports` | Массив строк; `[]` | Открытые порты, например `["8080", "8443/tcp", "8125/udp"]`. Если протокол не указан, добавляется `/tcp`. Порты дополняют значения базового образа. |
 | `workdir` | Строка; наследуется из базового образа | Рабочий каталог процесса, например `"/var/lib/taskd"`. Для `scratch` значение отсутствует, пока не задано явно. |
 | `user` | Строка; наследуется из базового образа | Пользователь процесса, например `"65532:65532"`, `"1000"` или `"app"`. RIB записывает значение в OCI config и не проверяет наличие пользователя внутри rootfs. |
@@ -148,7 +149,9 @@ cmd = ["serve", "--title", "Task service"]
 
 Credentials, Docker config и формат progress намеренно не поддерживаются в
 metadata. Они задаются флагами `--credential`, `--docker-config` и `--progress`
-либо через окружение. Секреты не должны храниться в `Cargo.toml`.
+либо через окружение. Секреты не должны храниться в `Cargo.toml`. Поле `env`
+также попадает в публикуемую конфигурацию образа, поэтому не записывайте туда
+пароли и токены.
 
 ## Правила объединения metadata и CLI
 
@@ -160,8 +163,10 @@ metadata. Они задаются флагами `--credential`, `--docker-confi
   включают опцию, `--cache=false` отключает её. Аналогично работают
   `--keep-cmd`, `--from-plain-http`, `--from-skip-tls`, `--to-plain-http`
   и `--to-skip-tls`. Без флага сохраняется значение metadata.
-- `to`, `copies`, `labels`, `ports` и аргументы Cargo дополняются: сначала
-  используются значения metadata, затем CLI.
+- `to`, `copies`, `labels`, `env`, `ports` и аргументы Cargo дополняются:
+  сначала используются значения metadata, затем CLI. При повторении ключа в
+  `env` остаётся последнее значение, поэтому `--env` перекрывает значение из
+  metadata.
 - Artifact всегда добавляется последним слоем и не может быть перекрыт более
   ранним дополнительным `COPY`.
 - Путь к artifact и source-пути `copies` из CLI разрешаются относительно
@@ -215,6 +220,7 @@ labels = [
   "org.opencontainers.image.title=taskd",
   "org.opencontainers.image.version=0.1.0",
 ]
+env = ["RUST_LOG=info", "APP_MODE=production"]
 ports = ["8080/tcp"]
 workdir = "/"
 user = "65532:65532"
@@ -271,6 +277,7 @@ cargo rib build \
   --destination /taskd \
   --copy config/default.toml:/etc/taskd/config.toml \
   --entrypoint /taskd \
+  --env RUST_LOG=info \
   -- \
   --release --locked --target x86_64-unknown-linux-musl --bin taskd
 ```

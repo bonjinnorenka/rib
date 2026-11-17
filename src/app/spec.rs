@@ -140,6 +140,7 @@ pub(crate) struct ImageBuildSpec {
     pub(crate) entrypoint: Option<Vec<String>>,
     pub(crate) cmd: Option<Vec<String>>,
     pub(crate) labels: Vec<String>,
+    pub(crate) envs: Vec<String>,
     pub(crate) ports: Vec<String>,
     pub(crate) workdir: Option<String>,
     pub(crate) user: Option<String>,
@@ -169,6 +170,7 @@ pub struct BuildRequest {
     pub(super) entrypoint: Option<Vec<String>>,
     pub(super) cmd: Option<Vec<String>>,
     pub(super) labels: BTreeMap<String, String>,
+    pub(super) envs: Vec<(String, String)>,
     pub(super) ports: Vec<String>,
     pub(super) workdir: Option<String>,
     pub(super) user: Option<String>,
@@ -220,6 +222,10 @@ impl BuildRequest {
     }
     pub(crate) fn keep_cmd(&self) -> bool {
         self.keep_cmd
+    }
+    #[cfg(test)]
+    pub(crate) fn envs(&self) -> &[(String, String)] {
+        &self.envs
     }
 }
 
@@ -296,6 +302,7 @@ impl TryFrom<ImageBuildSpec> for BuildRequest {
                 Ok((key.to_string(), value.to_string()))
             })
             .collect::<Result<_>>()?;
+        let envs = normalize_env(&specification.envs)?;
         let ports = specification
             .ports
             .into_iter()
@@ -326,6 +333,7 @@ impl TryFrom<ImageBuildSpec> for BuildRequest {
             entrypoint: specification.entrypoint,
             cmd: specification.cmd,
             labels,
+            envs,
             ports,
             workdir: specification.workdir,
             user: specification.user,
@@ -337,6 +345,44 @@ impl TryFrom<ImageBuildSpec> for BuildRequest {
             cache: specification.cache,
         })
     }
+}
+
+/// Parse one explicit `KEY=VALUE` entry. Only the first `=` separates the key,
+/// and a bare key is rejected instead of reading the host environment.
+fn parse_env(raw: &str) -> Result<(String, String)> {
+    let (key, value) = raw.split_once('=').ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid environment entry {raw:?}; expected KEY=VALUE (a bare KEY is not read from the host environment)"
+        )
+    })?;
+    if key.is_empty() {
+        bail!("invalid environment entry; KEY must not be empty (expected KEY=VALUE)");
+    }
+    if key.contains('\0') {
+        bail!("invalid environment entry {key:?}; KEY must not contain NUL");
+    }
+    if value.contains('\0') {
+        bail!("invalid environment entry for key {key:?}; VALUE must not contain NUL");
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+/// Validate explicit entries and collapse duplicate keys, keeping the position
+/// of the first occurrence and the value of the last occurrence.
+fn normalize_env(entries: &[String]) -> Result<Vec<(String, String)>> {
+    let mut normalized: Vec<(String, String)> = Vec::with_capacity(entries.len());
+    for raw in entries {
+        let (key, value) = parse_env(raw)?;
+        if let Some(existing) = normalized
+            .iter_mut()
+            .find(|(existing_key, _)| *existing_key == key)
+        {
+            existing.1 = value;
+        } else {
+            normalized.push((key, value));
+        }
+    }
+    Ok(normalized)
 }
 
 fn registry_options(
@@ -432,6 +478,7 @@ mod tests {
             entrypoint: None,
             cmd: None,
             labels: Vec::new(),
+            envs: Vec::new(),
             ports: Vec::new(),
             workdir: None,
             user: None,
@@ -468,6 +515,38 @@ mod tests {
         );
 
         assert!(BuildRequest::try_from(specification(RegistryClientSpec::default())).is_ok());
+    }
+
+    #[test]
+    fn environment_entries_are_parsed_and_normalized() {
+        assert_eq!(
+            parse_env("A=1").unwrap(),
+            ("A".to_string(), "1".to_string())
+        );
+        assert_eq!(parse_env("A=").unwrap(), ("A".to_string(), String::new()));
+        assert_eq!(
+            parse_env("A=x=y").unwrap(),
+            ("A".to_string(), "x=y".to_string())
+        );
+
+        for invalid in ["A", "=value", "A=\0", "\0A=value"] {
+            assert!(
+                parse_env(invalid).is_err(),
+                "expected {invalid:?} to be rejected"
+            );
+        }
+
+        let entries = ["A=1", "B=2", "A=3"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            normalize_env(&entries).unwrap(),
+            vec![
+                ("A".to_string(), "3".to_string()),
+                ("B".to_string(), "2".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -545,6 +624,7 @@ mod tests {
             entrypoint: None,
             cmd: None,
             labels: Vec::new(),
+            envs: Vec::new(),
             ports: Vec::new(),
             workdir: None,
             user: None,
@@ -608,6 +688,7 @@ mod tests {
             entrypoint: None,
             cmd: None,
             labels: Vec::new(),
+            envs: Vec::new(),
             ports: Vec::new(),
             workdir: None,
             user: None,
@@ -635,6 +716,7 @@ mod tests {
             entrypoint: None,
             cmd: None,
             labels: Vec::new(),
+            envs: Vec::new(),
             ports: Vec::new(),
             workdir: None,
             user: None,

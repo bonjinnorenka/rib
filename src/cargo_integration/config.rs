@@ -35,6 +35,7 @@ pub(super) struct CargoRibConfig {
     pub(super) entrypoint: Option<ConfigArgv>,
     pub(super) cmd: Option<ConfigArgv>,
     pub(super) labels: Vec<String>,
+    pub(super) env: Vec<String>,
     pub(super) ports: Vec<String>,
     pub(super) workdir: Option<String>,
     pub(super) user: Option<String>,

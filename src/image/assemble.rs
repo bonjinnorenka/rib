@@ -19,6 +19,7 @@ pub struct AssembleOptions {
     pub entrypoint: Option<Vec<String>>,
     pub cmd: Option<Vec<String>>,
     pub labels: BTreeMap<String, String>,
+    pub envs: Vec<(String, String)>,
     pub ports: Vec<String>,
     pub workdir: Option<String>,
     pub user: Option<String>,
@@ -83,6 +84,11 @@ pub fn assemble(options: AssembleOptions) -> Result<ImageBundle> {
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
         runtime.set_labels(Some(labels));
+    }
+
+    if !options.envs.is_empty() {
+        let inherited = runtime.env().clone().unwrap_or_default();
+        runtime.set_env(Some(merge_env(inherited, &options.envs)));
     }
 
     if !options.ports.is_empty() {
@@ -173,6 +179,43 @@ pub fn assemble(options: AssembleOptions) -> Result<ImageBundle> {
         manifest_digest,
         layers,
     })
+}
+
+/// Merge explicit environment entries into the inherited list while keeping
+/// the ordering deterministic. Inherited entries keep their first position;
+/// duplicate keys collapse to their last value. Explicit entries replace a
+/// matching key in place or append new keys in first-occurrence order.
+fn merge_env(inherited: Vec<String>, overrides: &[(String, String)]) -> Vec<String> {
+    let mut entries = Vec::with_capacity(inherited.len() + overrides.len());
+    let mut positions: HashMap<String, usize> = HashMap::new();
+
+    for entry in inherited {
+        match entry.split_once('=') {
+            Some((key, _)) if !key.is_empty() => {
+                if let Some(position) = positions.get(key).copied() {
+                    entries[position] = entry;
+                } else {
+                    positions.insert(key.to_string(), entries.len());
+                    entries.push(entry);
+                }
+            }
+            // Preserve malformed inherited entries verbatim; only explicit
+            // overrides are validated.
+            _ => entries.push(entry),
+        }
+    }
+
+    for (key, value) in overrides {
+        let assignment = format!("{key}={value}");
+        if let Some(position) = positions.get(key.as_str()).copied() {
+            entries[position] = assignment;
+        } else {
+            positions.insert(key.clone(), entries.len());
+            entries.push(assignment);
+        }
+    }
+
+    entries
 }
 
 fn validate_layer_count(config: &ImageConfiguration, layer_count: usize) -> Result<()> {
@@ -281,6 +324,22 @@ mod tests {
         build_copy_layer(&spec).unwrap()
     }
 
+    fn base_with_env(entries: &[&str]) -> Image {
+        let mut base = base(0, true);
+        base.config.set_config(Some(
+            ConfigBuilder::default()
+                .env(
+                    entries
+                        .iter()
+                        .map(|entry| entry.to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .build()
+                .unwrap(),
+        ));
+        base
+    }
+
     fn options(base: Image, new_layers: Vec<Layer>) -> AssembleOptions {
         AssembleOptions {
             base,
@@ -288,6 +347,7 @@ mod tests {
             entrypoint: None,
             cmd: None,
             labels: BTreeMap::new(),
+            envs: Vec::new(),
             ports: vec![],
             workdir: None,
             user: None,
@@ -381,6 +441,141 @@ mod tests {
         );
         assert_eq!(runtime.working_dir().as_deref(), Some("/srv"));
         assert_eq!(runtime.user().as_deref(), Some("1000:1000"));
+    }
+
+    #[test]
+    fn env_is_merged_with_base_and_explicit_values_win() {
+        let base = base_with_env(&[
+            "PATH=/usr/bin",
+            "KEEP=base",
+            "OVERRIDE=old",
+            "DUP=first",
+            "DUP=second",
+        ]);
+        let mut options = options(base, vec![]);
+        options.envs = vec![
+            ("OVERRIDE".to_string(), "new".to_string()),
+            ("ADDED".to_string(), "1".to_string()),
+            ("ADDED".to_string(), "2".to_string()),
+            ("OVERRIDE".to_string(), "final".to_string()),
+        ];
+        let bundle = assemble(options).unwrap();
+        assert_eq!(
+            bundle.config.config().as_ref().unwrap().env().as_ref(),
+            Some(&vec![
+                "PATH=/usr/bin".to_string(),
+                "KEEP=base".to_string(),
+                "OVERRIDE=final".to_string(),
+                "DUP=second".to_string(),
+                "ADDED=2".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn env_without_overrides_is_untouched() {
+        let base = base_with_env(&["A=1", "B=2"]);
+        let bundle = assemble(options(base, vec![])).unwrap();
+        assert_eq!(
+            bundle.config.config().as_ref().unwrap().env().as_ref(),
+            Some(&vec!["A=1".to_string(), "B=2".to_string()])
+        );
+    }
+
+    #[test]
+    fn env_override_leaves_other_runtime_fields_untouched() {
+        let mut base = base(0, true);
+        base.config.set_config(Some(
+            ConfigBuilder::default()
+                .entrypoint(vec!["/bin/base".to_string()])
+                .cmd(vec!["--default".to_string()])
+                .labels(HashMap::from([("keep".to_string(), "base".to_string())]))
+                .env(vec!["APP_MODE=old".to_string()])
+                .build()
+                .unwrap(),
+        ));
+        let mut options = options(base, vec![]);
+        options.envs = vec![("APP_MODE".to_string(), "new".to_string())];
+        let bundle = assemble(options).unwrap();
+        let runtime = bundle.config.config().as_ref().unwrap();
+
+        assert_eq!(
+            runtime.env().as_ref(),
+            Some(&vec!["APP_MODE=new".to_string()])
+        );
+        assert_eq!(
+            runtime.entrypoint().as_ref(),
+            Some(&vec!["/bin/base".to_string()])
+        );
+        assert_eq!(runtime.cmd().as_ref(), Some(&vec!["--default".to_string()]));
+        assert_eq!(
+            runtime
+                .labels()
+                .as_ref()
+                .unwrap()
+                .get("keep")
+                .map(String::as_str),
+            Some("base")
+        );
+    }
+
+    #[test]
+    fn scratch_env_is_created_from_an_empty_base() {
+        let scratch = Image::scratch(&Platform::from_str("linux/amd64").unwrap()).unwrap();
+        let mut options = options(scratch, vec![]);
+        options.envs = vec![
+            ("RUST_LOG".to_string(), "info".to_string()),
+            ("EMPTY".to_string(), String::new()),
+        ];
+        let bundle = assemble(options).unwrap();
+        assert_eq!(
+            bundle.config.config().as_ref().unwrap().env().as_ref(),
+            Some(&vec!["RUST_LOG=info".to_string(), "EMPTY=".to_string(),])
+        );
+    }
+
+    #[test]
+    fn env_only_changes_config_and_manifest_digests() {
+        let plain = assemble(options(base(1, true), vec![])).unwrap();
+        let mut options = options(base(1, true), vec![]);
+        options.envs = vec![("APP_MODE".to_string(), "production".to_string())];
+        let with_env = assemble(options).unwrap();
+
+        assert_eq!(
+            plain.config.rootfs().diff_ids(),
+            with_env.config.rootfs().diff_ids()
+        );
+        assert_eq!(
+            plain
+                .layers
+                .iter()
+                .map(|layer| layer.descriptor().digest())
+                .collect::<Vec<_>>(),
+            with_env
+                .layers
+                .iter()
+                .map(|layer| layer.descriptor().digest())
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(plain.config_digest, with_env.config_digest);
+        assert_ne!(plain.manifest_digest, with_env.manifest_digest);
+    }
+
+    #[test]
+    fn env_merge_is_reproducible() {
+        let build = || {
+            let mut options = options(base(0, true), vec![]);
+            options.envs = vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+                ("A".to_string(), "3".to_string()),
+            ];
+            assemble(options).unwrap()
+        };
+        let first = build();
+        let second = build();
+        assert_eq!(first.config_bytes, second.config_bytes);
+        assert_eq!(first.manifest_bytes, second.manifest_bytes);
     }
 
     #[test]

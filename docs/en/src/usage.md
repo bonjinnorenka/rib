@@ -103,6 +103,35 @@ that form. `scratch:latest` is treated as an ordinary image reference that
 shell. Include every runtime dependency in the artifact or add it through
 another `--copy` option.
 
+## Container environment
+
+Use repeatable `--env KEY=VALUE` to set OCI `config.Env` defaults for both
+registry-based and `scratch` images:
+
+```bash
+rib build \
+  --from debian:trixie-slim \
+  --copy ./server:/app/server,mode=0755 \
+  --env RUST_LOG=info \
+  --env APP_MODE=production \
+  --env WHISPER_MODEL_PATH=/models/ggml.bin \
+  --to oci-archive:dist/app.tar
+```
+
+Only the first `=` separates the key from the value, so `--env A=x=y` sets `A`
+to `x=y`, and `--env A=` sets an empty value. For duplicate keys the last
+value wins. Entries without `=` are rejected; `rib` never reads or expands
+values from the host environment.
+
+With a registry base, inherited `Env` entries are preserved. An explicit key
+replaces the inherited value in place, and new keys are appended in
+first-use order. With `--from scratch`, `Env` is created from the supplied
+entries. Setting only environment variables does not add a filesystem layer.
+
+`config.Env` is visible to anyone who can pull or inspect the image. Never bake
+passwords, API tokens, or other secrets into it; pass sensitive values through
+deployment-time environment or secrets instead.
+
 ## The `--copy` format
 
 ```text

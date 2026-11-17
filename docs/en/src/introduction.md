@@ -70,8 +70,8 @@ contents:
 
 For a registry base image, `rib` clones the base configuration, appends layer
 and history data, sets `created`, and applies explicitly requested runtime
-metadata such as `--entrypoint` and `--label`. Other fields, including the
-base `Env`, are preserved; the current CLI does not modify `Env`.
+metadata such as `--entrypoint`, `--label`, and `--env`. Other fields are
+preserved; without `--env`, the base `Env` remains unchanged.
 
 For `scratch`, the configuration is created from nothing. The standalone CLI
 uses `--platform` or its `linux/amd64` default; Cargo integration requires the
