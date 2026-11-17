@@ -1,14 +1,14 @@
 [package]
 name = "rust-image-builder"
 default-run = "rib"
-version = "0.2.0"
+version = "0.2.0-fork.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Daemonless OCI image builder optimized for reproducible COPY layers"
 readme = "README.crates.io.md"
 documentation = "https://kuzmenkodm.github.io/rib/en/"
 license = "MIT"
-repository = "https://github.com/kuzmenkodm/rib"
+repository = "https://github.com/bonjinnorenka/rib"
 keywords = ["oci", "container", "image", "docker", "jib"]
 categories = ["command-line-utilities", "development-tools::build-utils", "development-tools::cargo-plugins"]
 
@@ -70,7 +70,8 @@ strip = true
 artifact = "target/x86_64-unknown-linux-musl/release/rib"
 platform = "linux/amd64"
 from = "alpine:3.23.5"
-to = ["registry:ghcr.io/kuzmenkodm/rib:latest", "registry:ghcr.io/kuzmenkodm/rib:0.1.0-alpine"]
+to = ["oci-archive:target/rib-fork.oci.tar"]
+local-only = true
 entrypoint = "/bin/sh"
 destination = "/usr/bin/rib"
 creation-time = "epoch"
