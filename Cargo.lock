@@ -1604,7 +1604,7 @@ dependencies = [
 
 [[package]]
 name = "rust-image-builder"
-version = "0.2.0-fork.1"
+version = "0.2.0-fork.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
