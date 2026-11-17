@@ -34,7 +34,7 @@ jobs:
           jq -e '
             [.packages[] | select(.name == "rust-image-builder")] |
             length == 1 and
-            .[0].version == "0.2.0-fork.1" and
+            .[0].version == "0.2.0-fork.2" and
             .[0].metadata.rib["local-only"] == true and
             (.[0].metadata.rib.to | length) == 1 and
             (.[0].metadata.rib.to | all(startswith("oci-archive:")))
@@ -45,7 +45,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          target/x86_64-unknown-linux-gnu/release/rib --version | grep -F '0.2.0-fork.1'
+          target/x86_64-unknown-linux-gnu/release/rib --version | grep -F '0.2.0-fork.2'
           target/x86_64-unknown-linux-gnu/release/cargo-rib --version
           target/x86_64-unknown-linux-gnu/release/rib build --help > /dev/null
           mkdir -p dist
