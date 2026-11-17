@@ -52,3 +52,33 @@ jobs:
           tar -czf dist/rib-preflight-x86_64-unknown-linux-gnu.tar.gz \
             -C target/x86_64-unknown-linux-gnu/release rib cargo-rib
           (cd dist && sha256sum rib-preflight-x86_64-unknown-linux-gnu.tar.gz > SHA256SUMS && sha256sum -c SHA256SUMS)
+
+  annotated-tag-regression:
+    name: Release tag object regression
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout without persistent credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Reproduce peeled checkout tag and verify remote annotated tag
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          release_tag="v0.2.0-fork.1"
+          # Fetch the real annotated tag into an independent verification ref.
+          git fetch --no-tags origin \
+            "+refs/tags/$release_tag:refs/validation/release-tag"
+          tagged_commit="$(git rev-parse 'refs/validation/release-tag^{commit}')"
+          [[ "$(git cat-file -t refs/validation/release-tag)" == "tag" ]]
+          tag_oid="$(git rev-parse refs/validation/release-tag)"
+          # Simulate checkout@v4 using the peeled commit as a tag ref.
+          # This is a LOCAL ref mutation, not a remote tag modification.
+          git update-ref "refs/tags/$release_tag" "$tagged_commit"
+          [[ "$(git cat-file -t "refs/tags/$release_tag")" == "commit" ]]
+          [[ "$(git cat-file -t refs/validation/release-tag)" == "tag" ]]
+          [[ "$(git rev-parse 'refs/validation/release-tag^{commit}')" == "$tagged_commit" ]]
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$tagged_commit" refs/remotes/origin/main
+          [[ "$(git cat-file -p "$tag_oid" | sed -n 's/^tag //p' | head -n 1)" == "$release_tag" ]]
+          echo "PASS: annotated remote tag remains independently verifiable after local checkout ref is peeled"
