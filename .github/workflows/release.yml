@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*-fork.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing annotated fork release tag to publish"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -13,48 +19,79 @@ env:
 
 jobs:
   verify-tag:
-    name: Verify annotated fork tag on current main
+    name: Verify annotated fork tag on protected main
+    if: >-
+      github.repository == 'bonjinnorenka/rib' &&
+      ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.verify.outputs.tag }}
+      tag_oid: ${{ steps.verify.outputs.tag_oid }}
+      commit: ${{ steps.verify.outputs.commit }}
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
     steps:
-      - name: Checkout tag and complete history
+      - name: Checkout main and full history (no persistent token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: main
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify tag, version, and protected main ancestry
+      - name: Verify remote annotated tag, Cargo version and protected main ancestry
+        id: verify
         shell: bash
         run: |
           set -Eeuo pipefail
-          [[ "$GITHUB_REF" == refs/tags/* ]] || { echo "not a tag event" >&2; exit 1; }
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$ ]] || {
-            echo "not a fork release tag: $GITHUB_REF_NAME" >&2
-            exit 1
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-fork\.[0-9]+$ ]] || {
+            echo "invalid fork release tag: $RELEASE_TAG" >&2; exit 1
           }
-          [[ "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" == "tag" ]] || {
+
+          # checkout@v4 fetches annotated tags and can replace refs/tags/<name>
+          # with a peeled commit when checkout is triggered by a tag push.
+          # Fetch the authoritative tag OBJECT into a separate, non-tag ref.
+          git fetch --no-tags origin \
+            "+refs/tags/$RELEASE_TAG:refs/validation/release-tag"
+          tag_oid="$(git rev-parse refs/validation/release-tag)"
+          [[ "$(git cat-file -t "$tag_oid")" == "tag" ]] || {
             echo "release tags must be annotated" >&2; exit 1
           }
-          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rust-image-builder") | .version')"
-          [[ "$GITHUB_REF_NAME" == "v$version" ]] || {
-            echo "tag $GITHUB_REF_NAME does not match Cargo package version v$version" >&2; exit 1
+          tag_name="$(git cat-file -p "$tag_oid" | sed -n 's/^tag //p' | head -n 1)"
+          [[ "$tag_name" == "$RELEASE_TAG" ]] || {
+            echo "tag object name does not match requested release tag" >&2; exit 1
           }
+          tagged_commit="$(git rev-parse "refs/validation/release-tag^{commit}")"
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          tagged_commit="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
           main_commit="$(git rev-parse refs/remotes/origin/main)"
-          [[ "$tagged_commit" == "$GITHUB_SHA" ]] || {
-            echo "tag target differs from workflow checkout" >&2; exit 1
-          }
           git merge-base --is-ancestor "$tagged_commit" "$main_commit" || {
-            echo "tag is not reachable from main" >&2; exit 1
+            echo "tag target is not reachable from protected main" >&2; exit 1
           }
-          [[ "$tagged_commit" == "$main_commit" ]] || {
-            echo "release tag must point at the current main HEAD" >&2; exit 1
+
+          # A manual rerun from main must still accept a release tag pointing
+          # to an earlier reviewed main commit after this workflow fix merges.
+          # Read the VERSION from the TAGGED commit, not current main.
+          version="$(git show "$tagged_commit:Cargo.toml" |
+            python3 -c 'import sys,tomllib; print(tomllib.loads(sys.stdin.read())["package"]["version"])')"
+          [[ "$RELEASE_TAG" == "v$version" ]] || {
+            echo "tag $RELEASE_TAG does not match tagged Cargo package version v$version" >&2; exit 1
           }
-          echo "Verified annotated $GITHUB_REF_NAME at main $main_commit"
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_SHA" != "$tagged_commit" ]]; then
+            echo "tag target differs from push event SHA" >&2; exit 1
+          fi
+          {
+            echo "tag=$RELEASE_TAG"
+            echo "tag_oid=$tag_oid"
+            echo "commit=$tagged_commit"
+          } >> "$GITHUB_OUTPUT"
+          echo "Verified annotated $RELEASE_TAG ($tag_oid) at reviewed main commit $tagged_commit"
 
   build:
     name: Build and attest Ubuntu 24.04 x86_64 GNU
     needs: verify-tag
     runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -62,9 +99,10 @@ jobs:
       attestations: write
       artifact-metadata: write
     steps:
-      - name: Checkout verified tag
+      - name: Checkout exact verified release commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ needs.verify-tag.outputs.commit }}
           persist-credentials: false
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.94.0
@@ -76,9 +114,9 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          ./target/x86_64-unknown-linux-gnu/release/rib --version | grep -F "0.2.0-fork.1"
+          ./target/x86_64-unknown-linux-gnu/release/rib --version | grep -F "${RELEASE_TAG#v}"
           ./target/x86_64-unknown-linux-gnu/release/cargo-rib --version
-          archive="rib-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          archive="rib-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
           mkdir -p dist
           tar -czf "dist/$archive" -C target/x86_64-unknown-linux-gnu/release rib cargo-rib
           (cd dist && sha256sum "$archive" > "$archive.sha256" && sha256sum --check "$archive.sha256")
@@ -105,6 +143,9 @@ jobs:
     name: Publish immutable-by-policy GitHub Release
     needs: build
     runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
+      VERIFIED_TAG_OID: ${{ needs.verify-tag.outputs.tag_oid }}
     permissions:
       contents: write
     steps:
@@ -121,14 +162,19 @@ jobs:
         run: |
           set -Eeuo pipefail
           (cd dist && sha256sum --check *.sha256)
-          archive="rib-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          archive="rib-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
           test -s "dist/$archive"
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+          # Catch tag replacement/deletion between verification and publishing.
+          remote_tag_oid="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          [[ "$remote_tag_oid" == "$VERIFIED_TAG_OID" ]] || {
+            echo "release tag changed since verification; refusing to publish" >&2; exit 1
+          }
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "release already exists; refusing to overwrite" >&2
             exit 1
           fi
-          gh release create "$GITHUB_REF_NAME" "dist/$archive" "dist/$archive.sha256" \
+          gh release create "$RELEASE_TAG" "dist/$archive" "dist/$archive.sha256" \
             --verify-tag \
-            --title "$GITHUB_REF_NAME" \
+            --title "$RELEASE_TAG" \
             --generate-notes \
             --prerelease
