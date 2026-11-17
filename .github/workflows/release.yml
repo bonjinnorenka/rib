@@ -141,7 +141,7 @@ jobs:
 
   publish:
     name: Publish immutable-by-policy GitHub Release
-    needs: build
+    needs: [verify-tag, build]
     runs-on: ubuntu-24.04
     env:
       RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
