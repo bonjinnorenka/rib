@@ -117,6 +117,7 @@ impl BuildRequest {
             entrypoint: self.entrypoint,
             cmd: self.cmd,
             labels: self.labels,
+            envs: self.envs,
             ports: self.ports,
             workdir: self.workdir,
             user: self.user,

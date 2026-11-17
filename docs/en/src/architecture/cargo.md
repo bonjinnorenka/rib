@@ -85,6 +85,7 @@ metadata field when a CI job should publish only to its dynamic destination.
 | `entrypoint` | String or string array; `[destination]` | OCI Entrypoint, such as `"/taskd --log-format json"` or `["/taskd", "--log-format", "json"]`. Replacing it clears inherited Cmd unless `cmd` or `keep-cmd = true` is set. |
 | `cmd` | String or string array; not explicitly set | OCI Cmd, such as `["serve", "--port", "8080"]`; replaces inherited Cmd. |
 | `labels` | String array; `[]` | `key=value` labels merged with base labels; duplicate keys are overwritten. |
+| `env` | String array; `[]` | `KEY=VALUE` environment entries merged with base `Env`; duplicate keys keep the last value. CLI entries are applied after metadata entries. |
 | `ports` | String array; `[]` | Ports such as `["8080", "8443/tcp", "8125/udp"]`; omitted protocols become `/tcp`. |
 | `workdir` | String; inherited | Process working directory, for example `"/var/lib/taskd"`. |
 | `user` | String; inherited | OCI user such as `"65532:65532"`, `"1000"`, or `"app"`; existence is not checked in rootfs. |
@@ -117,7 +118,9 @@ be exact.
 
 Credentials, Docker configuration, and progress mode are intentionally absent
 from metadata. Supply them through `--credential`, `--docker-config`, and
-`--progress` or the environment; do not put secrets in `Cargo.toml`.
+`--progress` or the environment; do not put secrets in `Cargo.toml`. The `env`
+field also becomes part of the public image configuration, so never place
+passwords or tokens there.
 
 ## Metadata and CLI merging
 
@@ -126,8 +129,9 @@ from metadata. Supply them through `--credential`, `--docker-config`, and
   enable caching, while `--cache=false` disables it. The same syntax applies
   to `--keep-cmd`, `--from-plain-http`, `--from-skip-tls`, `--to-plain-http`,
   and `--to-skip-tls`. Omitting the flag retains the metadata value.
-- `to`, `copies`, `labels`, `ports`, and Cargo arguments are concatenated with
-  metadata values first.
+- `to`, `copies`, `labels`, `env`, `ports`, and Cargo arguments are
+  concatenated with metadata values first. For duplicate environment keys, the
+  last value wins, so `--env` overrides a metadata `env` entry.
 - The artifact is always the final layer.
 - Artifact and copy sources from metadata are relative to `Cargo.toml`; CLI
   sources are relative to the current working directory.
@@ -176,6 +180,7 @@ labels = [
   "org.opencontainers.image.title=taskd",
   "org.opencontainers.image.version=0.1.0",
 ]
+env = ["RUST_LOG=info", "APP_MODE=production"]
 ports = ["8080/tcp"]
 workdir = "/"
 user = "65532:65532"
@@ -231,6 +236,7 @@ cargo rib build \
   --destination /taskd \
   --copy config/default.toml:/etc/taskd/config.toml \
   --entrypoint /taskd \
+  --env RUST_LOG=info \
   -- \
   --release --locked --target x86_64-unknown-linux-musl --bin taskd
 ```

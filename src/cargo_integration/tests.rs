@@ -142,6 +142,40 @@ fn cli_cmd_overrides_configured_cmd() {
 }
 
 #[test]
+fn configured_and_cli_env_merge_with_cli_last_wins() {
+    let project = TempDir::new().unwrap();
+    let package = CargoPackage {
+        id: "demo".to_string(),
+        name: "demo".to_string(),
+        manifest_path: project.path().join("Cargo.toml"),
+        metadata: serde_json::json!({
+            "rib": {
+                "artifact": "target/release/demo",
+                "platform": "linux/amd64",
+                "from": "scratch",
+                "to": ["oci-archive:dist/image.tar"],
+                "env": ["A=base", "B=base"]
+            }
+        }),
+    };
+    let cli =
+        CargoRibCli::try_parse_from(["cargo-rib", "build", "--env", "A=cli", "--env", "C=x=y"])
+            .unwrap();
+    let arguments = match cli.command {
+        CargoRibCommand::Build(arguments) => *arguments,
+    };
+    let plan = resolve_plan(&arguments, &package, project.path()).unwrap();
+    assert_eq!(
+        plan.image.envs(),
+        &[
+            ("A".to_string(), "cli".to_string()),
+            ("B".to_string(), "base".to_string()),
+            ("C".to_string(), "x=y".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn configured_argv_accepts_arrays_and_quoted_lines() {
     let project = TempDir::new().unwrap();
     let package = CargoPackage {
@@ -239,6 +273,7 @@ platform = "linux/amd64"
 from = "scratch"
 to = ["oci-archive:dist/image.tar"]
 destination = "/usr/local/bin/fixture"
+env = ["APP_MODE=production"]
 cargo-args = ["--offline"]
 "#,
     )
@@ -252,7 +287,15 @@ cargo-args = ["--offline"]
     let cargo = cargo_executable();
     let metadata = read_metadata(&cargo, project.path()).await.unwrap();
     let package = select_package(&metadata, project.path()).unwrap();
-    let cli = CargoRibCli::try_parse_from(["cargo-rib", "build", "--progress", "quiet"]).unwrap();
+    let cli = CargoRibCli::try_parse_from([
+        "cargo-rib",
+        "build",
+        "--progress",
+        "quiet",
+        "--env",
+        "RUST_LOG=info",
+    ])
+    .unwrap();
     let arguments = match cli.command {
         CargoRibCommand::Build(arguments) => *arguments,
     };
@@ -295,6 +338,13 @@ cargo-args = ["--offline"]
     assert_eq!(
         config.config().as_ref().unwrap().entrypoint().as_ref(),
         Some(&vec!["/usr/local/bin/fixture".to_string()])
+    );
+    assert_eq!(
+        config.config().as_ref().unwrap().env().as_ref(),
+        Some(&vec![
+            "APP_MODE=production".to_string(),
+            "RUST_LOG=info".to_string(),
+        ])
     );
 }
 

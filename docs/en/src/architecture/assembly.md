@@ -77,9 +77,14 @@ paths or sensitive arguments.
 - Replacing it clears inherited `Cmd` unless `--keep-cmd` is set or a new
   `--cmd` is supplied. Explicit `--cmd` replaces the inherited value.
 - `--label` merges into base labels and overwrites matching keys.
+- `--env KEY=VALUE` merges into base `Env`: inherited order is retained,
+  matching keys are replaced in place, new keys are appended in first-use
+  order, and duplicate keys keep the last value. Without `--env`, the
+  inherited list is unchanged. Environment changes add no layer or history
+  entry.
 - `--port` extends base ports without duplicates.
 - `--workdir` and `--user` change only when explicitly supplied.
-- Other base metadata, including `Env`, is preserved.
+- Other base metadata is preserved.
 
 For `scratch`, only explicitly supplied runtime fields exist, alongside the
 builder-generated platform, creation time, rootfs, and history.

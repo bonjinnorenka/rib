@@ -142,6 +142,8 @@ pub(super) fn resolve_plan(
 
     let mut labels = config.labels;
     labels.extend(arguments.image.labels.iter().cloned());
+    let mut envs = config.env;
+    envs.extend(arguments.image.envs.iter().cloned());
     let mut ports = config.ports;
     ports.extend(arguments.image.ports.iter().cloned());
     let mut cargo_args = config.cargo_args;
@@ -174,6 +176,7 @@ pub(super) fn resolve_plan(
         entrypoint,
         cmd,
         labels,
+        envs,
         ports,
         workdir: arguments.image.workdir.clone().or(config.workdir),
         user: arguments.image.user.clone().or(config.user),

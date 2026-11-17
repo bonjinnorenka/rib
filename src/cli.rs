@@ -63,6 +63,12 @@ pub struct ImageConfigArgs {
     #[arg(long = "label")]
     pub labels: Vec<String>,
 
+    /// Container environment variable. Repeatable. Form: KEY=VALUE
+    /// The last value wins for duplicate keys. A bare KEY is rejected;
+    /// values are never read from the host environment or shell-expanded
+    #[arg(long = "env", verbatim_doc_comment)]
+    pub envs: Vec<String>,
+
     /// Exposed port. Repeatable. Form: 8080 or 8080/tcp
     #[arg(long = "port")]
     pub ports: Vec<String>,
@@ -329,6 +335,7 @@ impl TryFrom<BuildArgs> for ImageBuildSpec {
                 .transpose()?,
             cmd: arguments.image.cmd.as_deref().map(parse_argv).transpose()?,
             labels: arguments.image.labels,
+            envs: arguments.image.envs,
             ports: arguments.image.ports,
             workdir: arguments.image.workdir,
             user: arguments.image.user,
@@ -394,6 +401,55 @@ mod tests {
         assert_eq!(spec.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
         assert_eq!(spec.max_attempts, 5);
     }
+    fn build_request(extra: &[&str]) -> anyhow::Result<crate::app::spec::BuildRequest> {
+        let mut arguments = vec![
+            "rib",
+            "build",
+            "--from",
+            "scratch",
+            "--to",
+            "oci-archive:image.tar",
+        ];
+        arguments.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        let Command::Build(arguments) = cli.command;
+        crate::app::spec::BuildRequest::try_from(ImageBuildSpec::try_from(*arguments)?)
+    }
+
+    #[test]
+    fn env_flags_are_repeatable_and_last_value_wins() {
+        let request = build_request(&[
+            "--env", "A=1", "--env", "B=", "--env", "C=x=y", "--env", "A=2",
+        ])
+        .unwrap();
+        assert_eq!(
+            request.envs(),
+            &[
+                ("A".to_string(), "2".to_string()),
+                ("B".to_string(), String::new()),
+                ("C".to_string(), "x=y".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_flags_reject_bare_keys_and_empty_keys() {
+        let error = build_request(&["--env", "PATH"])
+            .err()
+            .expect("bare environment keys must be rejected")
+            .to_string();
+        assert!(error.contains("KEY=VALUE"), "unexpected error: {error}");
+
+        let error = build_request(&["--env", "=value"])
+            .err()
+            .expect("empty environment keys must be rejected")
+            .to_string();
+        assert!(
+            error.contains("KEY must not be empty"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn boolean_flags_preserve_short_form_and_allow_explicit_false() {
         for explicit in ["--cache", "--cache=true", "--cache=false"] {
